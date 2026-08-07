@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agent Spend Policy Engine</title>
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-title">
+      <h1>Agent Spend Policy Engine</h1>
+      <span class="badge">Algorand Testnet &middot; x402</span>
+    </div>
+    <div class="topbar-actions">
+      <label class="autoplay">
+        <input type="checkbox" id="autoplayToggle" />
+        Autoplay demo traffic
+      </label>
+      <button id="resetBtn" class="btn btn-ghost" title="Clears the local audit log only, no on-chain effect">
+        Reset demo log
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section id="agents" class="agents-grid"></section>
+
+    <section class="feed-section">
+      <h2>Live Request Feed</h2>
+      <div class="feed-table-wrap">
+        <table class="feed-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Agent</th>
+              <th>Action</th>
+              <th>Amount</th>
+              <th>Decision</th>
+              <th>Reason</th>
+              <th>Algorand Tx</th>
+            </tr>
+          </thead>
+          <tbody id="feedBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
