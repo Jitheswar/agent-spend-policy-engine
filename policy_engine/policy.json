@@ -14,19 +14,25 @@
   "agents": {
     "agent_weather": {
       "display_name": "Weather Bot",
-      "allowed_actions": ["weather"],
+      "allowed_actions": [
+        "weather"
+      ],
       "per_request_limit_usd": 0.02,
-      "daily_cap_usd": 1.00
+      "daily_cap_usd": 1.0
     },
     "agent_enrichment": {
       "display_name": "Enrichment Bot",
-      "allowed_actions": ["enrich"],
-      "per_request_limit_usd": 0.10,
-      "daily_cap_usd": 2.00
+      "allowed_actions": [
+        "enrich"
+      ],
+      "per_request_limit_usd": 0.1,
+      "daily_cap_usd": 2.0
     },
     "agent_rogue": {
       "display_name": "Rogue Bot (tightly capped, on purpose)",
-      "allowed_actions": ["weather"],
+      "allowed_actions": [
+        "weather"
+      ],
       "per_request_limit_usd": 0.01,
       "daily_cap_usd": 0.02
     }

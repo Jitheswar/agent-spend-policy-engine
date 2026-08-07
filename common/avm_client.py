@@ -53,6 +53,15 @@ def agent_address(agent_name: str, accounts: dict | None = None) -> str:
     return algosdk.encoding.encode_address(secret_key[32:])
 
 
+def agent_secret_key_b64(agent_name: str, accounts: dict | None = None) -> str:
+    """The base64 sk format algosdk expects for both transaction signing
+    (Transaction.sign) and arbitrary-message signing (algosdk.util.sign_bytes)
+    -- same key material, domain-separated by algosdk internally so a
+    signature under one scheme can't be replayed as the other."""
+    accounts = accounts or load_accounts()
+    return accounts[agent_name]["avm_private_key_b64"]
+
+
 def build_paying_session(agent_name: str, accounts: dict | None = None):
     """Returns (requests.Session, address, x402ClientSync) for this agent.
 

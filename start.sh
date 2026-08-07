@@ -5,10 +5,15 @@
 # accounts that are already opted in or still unfunded, and always (re)starts
 # the three services fresh.
 #
-#   ./start.sh
+#   ./start.sh              # fast path once accounts are set up
+#   ./start.sh --recheck    # force the on-chain balance/opt-in check again
 #
 set -euo pipefail
 cd "$(dirname "$0")"
+
+if [ "${1:-}" = "--recheck" ]; then
+  rm -f data/.setup_verified
+fi
 
 if [ ! -d .venv ]; then
   echo "==> Creating virtualenv..."
@@ -28,11 +33,21 @@ if [ ! -f data/accounts.json ]; then
   echo ""
 fi
 
-echo "==> Checking account balances..."
-python3 scripts/setup_accounts.py balances
+if [ -f data/.setup_verified ]; then
+  # Accounts were already confirmed funded + opted in on a previous run --
+  # skip re-checking 4 accounts against the public testnet API on every
+  # single startup. That's what was making this feel slow: it's a network
+  # round-trip per account, twice (balance check, then opt-in check), and
+  # the public AlgoNode endpoint is sometimes multiple seconds per call.
+  # Run `./start.sh --recheck` (or delete data/.setup_verified) to force it.
+  echo "==> Accounts already verified funded + opted in (skipping on-chain check; ./start.sh --recheck to force it)"
+else
+  echo "==> Checking account balances..."
+  python3 scripts/setup_accounts.py balances
 
-echo "==> Opting funded accounts into testnet USDC (skips unfunded/already-done)..."
-python3 scripts/setup_accounts.py optin
+  echo "==> Opting funded accounts into testnet USDC (skips unfunded/already-done)..."
+  python3 scripts/setup_accounts.py optin || true
+fi
 
 echo "==> Stopping any previous instances..."
 pkill -f "uvicorn resource_server.main:app" 2>/dev/null || true

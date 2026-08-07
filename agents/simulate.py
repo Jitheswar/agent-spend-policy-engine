@@ -7,6 +7,13 @@ Three fixed identities, matching policy_engine/policy.json:
                         cap in two calls, then keeps trying (denied), and
                         also tries an action it was never approved for.
 
+Every request is signed with the agent's own Algorand key (common.identity)
+-- this script has legitimate local access to that key material (see
+data/accounts.json), the same way a real autonomous agent process would
+hold its own key. That's what makes it a fair stand-in for "an agent," as
+opposed to the dashboard's Fire buttons, which represent a human operator
+and go through POST /admin/sign instead (see policy_engine/app.py).
+
 The scenario list below is a fixed, curated sequence rather than random
 firing, so a live demo always shows the same clean mix of approvals and
 denials instead of relying on luck.
@@ -21,6 +28,11 @@ import sys
 import time
 
 import requests
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from common.avm_client import agent_secret_key_b64, load_accounts  # noqa: E402
+from common.identity import sign_request  # noqa: E402
 
 POLICY_ENGINE_URL = os.getenv("POLICY_ENGINE_URL", "http://127.0.0.1:4022")
 
@@ -37,19 +49,33 @@ SCENARIOS = [
 ]
 
 
-def fire(agent_id: str, action: str) -> dict:
-    resp = requests.post(
-        f"{POLICY_ENGINE_URL}/spend",
-        json={"agent_id": agent_id, "action": action},
-        timeout=30,
-    )
+def fire(agent_id: str, action: str, accounts: dict, action_prices: dict) -> dict:
+    amount_usd = action_prices.get(action, 0.0)
+    body = {"agent_id": agent_id, "action": action, "amount_usd": amount_usd}
+
+    if agent_id in accounts:
+        # A real agent identity: sign for real with its own key.
+        sk_b64 = agent_secret_key_b64(agent_id, accounts)
+        body.update(sign_request(sk_b64, agent_id, action, amount_usd))
+    else:
+        # agent_ghost has no key on file by design (it's here to exercise
+        # the "unknown agent" denial). The policy engine rejects unknown
+        # agents before it ever looks at the signature, so these values
+        # just need to satisfy the request schema, not be valid.
+        body.update({"timestamp": time.time(), "nonce": "n/a", "signature": "n/a"})
+
+    resp = requests.post(f"{POLICY_ENGINE_URL}/spend", json=body, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def run_once():
+    accounts = load_accounts()
+    policy = requests.get(f"{POLICY_ENGINE_URL}/policy", timeout=10).json()
+    action_prices = {name: cfg["price_usd"] for name, cfg in policy["actions"].items()}
+
     for agent_id, action in SCENARIOS:
-        result = fire(agent_id, action)
+        result = fire(agent_id, action, accounts, action_prices)
         decision = result["decision"].upper()
         line = f"[{decision:7s}] {agent_id:16s} -> {action:8s}  {result['reason']}"
         if result.get("tx_id"):

@@ -1,20 +1,28 @@
 """x402-protected resource server.
 
 Hosts the paid APIs that agents want to call. Every route below is gated by
-the x402 payment middleware: an unpaid request gets HTTP 402 with payment
-requirements, a request bearing a valid X-PAYMENT header (a signed Algorand
-testnet transaction group) gets verified + settled through the public
-GoPlausible facilitator, then served.
+TWO layers, in this order (see PolicyAuthMiddleware docstring for why the
+order matters):
 
-This process knows nothing about policy -- it just sells API calls for USDC
-on Algorand testnet. The policy engine (policy_engine/app.py) sits in front
-of it and decides whether a request is even allowed to reach here.
+  1. PolicyAuthMiddleware -- rejects outright (403) any request that
+     doesn't carry a valid, unexpired token minted by the policy engine.
+     Without this, this process would happily sell API calls to anyone who
+     pays for them directly, completely bypassing policy_engine/app.py's
+     spend limits and daily caps. It has no idea that engine exists unless
+     something tells it to check.
+  2. The x402 payment middleware -- unpaid request gets HTTP 402 with
+     payment requirements, a request bearing a valid X-PAYMENT header (a
+     signed Algorand testnet transaction group) gets verified + settled
+     through the public GoPlausible facilitator, then served.
 """
 
 import json
 import os
+import sys
 
 from fastapi import FastAPI, Request
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
@@ -24,8 +32,14 @@ from x402.mechanisms.avm.exact import ExactAvmServerScheme
 from x402.schemas import AssetAmount
 from x402.server import x402ResourceServer
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from common.policy_auth import HEADER_NAME, verify_token  # noqa: E402
+
 ACCOUNTS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "accounts.json")
 FACILITATOR_URL = os.getenv("FACILITATOR_URL", "https://facilitator.goplausible.xyz")
+
+# Maps protected paths to the action name policy tokens are minted for.
+PROTECTED_ACTIONS = {"/weather": "weather", "/enrich": "enrich"}
 
 
 def _server_address() -> str:
@@ -78,6 +92,44 @@ routes = {
 }
 
 app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=server)
+
+
+class PolicyAuthMiddleware(BaseHTTPMiddleware):
+    """Rejects any request to a protected route that doesn't carry a valid
+    token from the policy engine, before the x402 middleware ever runs.
+
+    Starlette runs middleware added via add_middleware() in LAST-added,
+    first-executed order on incoming requests (verified empirically against
+    this installed version -- see scratch/middleware_order_test.py from the
+    session that added this). Registering this middleware AFTER
+    PaymentMiddlewareASGI above is what makes it the outer layer: an
+    unauthorized caller gets a 403 here and never even sees a 402, let
+    alone gets a chance to pay.
+    """
+
+    async def dispatch(self, request, call_next):
+        action = PROTECTED_ACTIONS.get(request.url.path)
+        if action is None:
+            return await call_next(request)
+
+        token = request.headers.get(HEADER_NAME)
+        if not token:
+            return JSONResponse(
+                {
+                    "error": "missing policy authorization",
+                    "detail": "this endpoint only serves requests that already cleared the policy engine",
+                },
+                status_code=403,
+            )
+
+        ok, reason, _claimed_agent_id = verify_token(token, action)
+        if not ok:
+            return JSONResponse({"error": "invalid policy authorization", "detail": reason}, status_code=403)
+
+        return await call_next(request)
+
+
+app.add_middleware(PolicyAuthMiddleware)
 
 
 @app.get("/health")
