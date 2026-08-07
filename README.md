@@ -89,7 +89,7 @@ Once every account is confirmed funded and opted in, a `data/.setup_verified`
 marker is written and every later `./start.sh` skips the on-chain
 balance/opt-in checks entirely -- those are real network round-trips
 against the public AlgoNode testnet API (occasionally multiple seconds per
-call), and re-running them on every startup when nothing's changed is what
+call), and re-runing them on every startup when nothing's changed is what
 made `./start.sh` feel slow. Run `./start.sh --recheck` (or delete
 `data/.setup_verified`) to force the checks again -- e.g. after re-funding
 an account.
