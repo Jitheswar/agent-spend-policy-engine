@@ -216,7 +216,54 @@
     <div class="section-head">
       <p class="section-label"><span class="section-num">02</span>Agent fleet</p>
       <span class="section-hint">live policy state &middot; refreshed every 2s</span>
+      <button type="button" class="btn btn-onboard" id="onboardBtn">+ Onboard an agent</button>
     </div>
+
+    <!-- Live agent onboarding. Registering the agent is instant; the
+         on-chain part (keypair, ALGO for fees, USDC opt-in, working
+         capital) runs in the background and is reported on the new card
+         as it lands. See common/provisioning.py. -->
+    <form class="onboard-panel" id="onboardPanel" hidden>
+      <div class="onboard-grid">
+        <label class="onboard-field">
+          <span>Agent id</span>
+          <input id="obId" type="text" value="agent_deepseek" pattern="[a-z0-9_]+" required
+                 title="lowercase letters, digits and underscores" />
+        </label>
+        <label class="onboard-field">
+          <span>Display name</span>
+          <input id="obName" type="text" value="DeepSeek Agent" required />
+        </label>
+        <label class="onboard-field onboard-field-sm">
+          <span>Per call</span>
+          <input id="obPerCall" type="number" step="0.01" min="0" value="0.02" required />
+        </label>
+        <label class="onboard-field onboard-field-sm">
+          <span>Daily cap</span>
+          <input id="obDailyCap" type="number" step="0.01" min="0" value="0.10" required />
+        </label>
+        <label class="onboard-field onboard-field-sm">
+          <span>Max req/min</span>
+          <input id="obRpm" type="number" step="1" min="0" value="15" />
+        </label>
+        <fieldset class="onboard-actions-field">
+          <legend>Allowed actions</legend>
+          <label><input type="checkbox" id="obActWeather" checked /> weather</label>
+          <label><input type="checkbox" id="obActEnrich" /> enrich</label>
+        </fieldset>
+      </div>
+      <div class="onboard-foot">
+        <p class="onboard-note">
+          Generates an Algorand keypair, registers it under these limits, then funds
+          it and opts it into testnet USDC on-chain &mdash; about 15 seconds, no restart.
+        </p>
+        <div class="onboard-buttons">
+          <button type="button" class="btn" id="obCancel">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="obSubmit">Onboard &amp; fund</button>
+        </div>
+      </div>
+    </form>
+
     <section id="agents" class="agents-grid"></section>
 
     <!-- Only rendered when something is actually waiting; an empty

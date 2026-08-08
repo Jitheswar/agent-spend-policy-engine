@@ -13,6 +13,8 @@ const statusChipEl = document.getElementById("statusChip");
 const statusLabelEl = document.getElementById("statusLabel");
 const approvalsEl = document.getElementById("approvals");
 const approvalsHeadEl = document.getElementById("approvalsHead");
+const onboardBtn = document.getElementById("onboardBtn");
+const onboardPanel = document.getElementById("onboardPanel");
 const anchorBtn = document.getElementById("anchorBtn");
 const tamperBtn = document.getElementById("tamperBtn");
 const restoreBtn = document.getElementById("restoreBtn");
@@ -426,6 +428,18 @@ function buildAgentCard(agent, index) {
   freezeBtn.onclick = () => toggleFreeze(agent.agent_id, freezeBtn);
   actionsEl.appendChild(freezeBtn);
 
+  // Only agents onboarded live carry a provisioning record, and only those
+  // get a deregister button -- the three agents the demo ships with are
+  // part of the fixed narrative and shouldn't be one misclick from gone.
+  if (agent.provisioning) {
+    const dropBtn = document.createElement("button");
+    dropBtn.className = "btn btn-deregister";
+    dropBtn.type = "button";
+    dropBtn.textContent = "Deregister agent";
+    dropBtn.onclick = () => deregisterAgent(agent.agent_id, dropBtn);
+    actionsEl.appendChild(dropBtn);
+  }
+
   const els = {};
   card.querySelectorAll("[data-el]").forEach((node) => {
     els[node.dataset.el] = node;
@@ -479,13 +493,34 @@ function patchAgentCard(agent, card, els) {
   els.freezeBtn.textContent = agent.frozen ? "Unfreeze agent" : "Freeze agent";
   els.freezeBtn.classList.toggle("is-frozen", !!agent.frozen);
 
-  // A frozen agent is stopped regardless of how much budget it has left, so
-  // its cap-derived mood would actively mislead here ("Within policy" on an
-  // agent that cannot spend at all). Frozen wins.
+  // A freshly onboarded agent whose funding hasn't landed is registered and
+  // fully governed, but has no ALGO for fees and no USDC to send -- so its
+  // spends would clear policy and then fail at settlement. Disable firing
+  // until it's genuinely able to pay, and say which step it's on.
+  const prov = agent.provisioning;
+  const funding = prov && prov.state === "funding";
+  card.classList.toggle("is-provisioning", !!funding);
+  card.classList.toggle("is-provision-failed", !!(prov && prov.state === "failed"));
+  card.querySelectorAll(".btn-fire").forEach((b) => {
+    b.disabled = !!funding;
+    b.title = funding ? "waiting for this agent's on-chain funding to confirm" : "";
+  });
+
+  // Precedence, most-overriding first: a frozen agent is stopped regardless
+  // of budget or funding, so its cap-derived mood would actively mislead
+  // ("Within policy" on an agent that cannot spend at all). Then provisioning
+  // state, which likewise makes the cap ring beside the point. Cap usage only
+  // describes an agent that is actually able to spend.
   card.classList.remove("mood-ok", "mood-warn", "mood-blocked", "mood-frozen");
   if (agent.frozen) {
     els.statusLabel.textContent = "Frozen — kill switch engaged";
     card.classList.add("mood-frozen");
+  } else if (funding) {
+    els.statusLabel.textContent = `Provisioning — ${prov.message}`;
+    card.classList.add("mood-warn");
+  } else if (prov && prov.state === "failed") {
+    els.statusLabel.textContent = `Provisioning failed — ${prov.message}`;
+    card.classList.add("mood-blocked");
   } else {
     const mood = capMood(pct);
     els.statusLabel.textContent = mood.label;
@@ -1153,6 +1188,93 @@ document.addEventListener("pointermove", (e) => {
    refresh() has always handled its own failures, so the poll is started
    first and unconditionally; policy config retries independently.
    ---------------------------------------------------------------------- */
+
+/* ----------------------------------------------------------------------
+   Live agent onboarding
+   ---------------------
+   Adding an agent is two operations with very different latencies, and the
+   UI is built around that gap rather than hiding it. Registration is a
+   local write and returns instantly -- the card appears on the next poll,
+   already governed by its caps. Funding it is three real Algorand
+   transactions (fee ALGO, USDC opt-in, working capital) and takes ~15s,
+   during which the agent genuinely cannot settle a payment. Its Fire
+   buttons stay disabled and the card says why, because an agent that looks
+   ready and then fails to pay reads as a broken system rather than an
+   honest one.
+   ---------------------------------------------------------------------- */
+
+onboardBtn.onclick = () => {
+  const showing = onboardPanel.hidden;
+  onboardPanel.hidden = !showing;
+  onboardBtn.classList.toggle("is-open", showing);
+  if (showing) document.getElementById("obId").focus();
+};
+
+document.getElementById("obCancel").onclick = () => {
+  onboardPanel.hidden = true;
+  onboardBtn.classList.remove("is-open");
+};
+
+onboardPanel.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const submit = document.getElementById("obSubmit");
+  const rpmRaw = document.getElementById("obRpm").value;
+  const allowed = [];
+  if (document.getElementById("obActWeather").checked) allowed.push("weather");
+  if (document.getElementById("obActEnrich").checked) allowed.push("enrich");
+
+  const body = {
+    agent_id: document.getElementById("obId").value.trim(),
+    display_name: document.getElementById("obName").value.trim(),
+    allowed_actions: allowed,
+    per_request_limit_usd: parseFloat(document.getElementById("obPerCall").value),
+    daily_cap_usd: parseFloat(document.getElementById("obDailyCap").value),
+    max_requests_per_minute: rpmRaw === "" ? null : parseInt(rpmRaw, 10),
+    fund: true,
+  };
+
+  submit.disabled = true;
+  submit.textContent = "Onboarding…";
+  try {
+    const created = await fetchJSON("/admin/agents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    onboardPanel.hidden = true;
+    onboardBtn.classList.remove("is-open");
+    toast({
+      decision: "approved",
+      title: `${created.display_name} registered`,
+      message: `Algorand address ${created.address.slice(0, 8)}… — funding it on-chain now.`,
+    });
+    refresh();
+  } catch (err) {
+    console.error("onboard failed", err);
+    toast({ decision: "denied", title: "Could not onboard that agent", message: err.message });
+  } finally {
+    submit.disabled = false;
+    submit.textContent = "Onboard & fund";
+  }
+});
+
+async function deregisterAgent(agentId, btn) {
+  if (!window.confirm(`Deregister ${agentId}? Its audit history and its key are kept.`)) return;
+  btn.disabled = true;
+  try {
+    await fetchJSON(`/admin/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" });
+    toast({
+      decision: "denied",
+      title: "Agent deregistered",
+      message: `${agentId} can no longer spend. Its past spends stay in the ledger.`,
+    });
+  } catch (e) {
+    toast({ decision: "denied", title: "Could not deregister", message: e.message });
+  } finally {
+    btn.disabled = false;
+    refresh();
+  }
+}
 
 async function loadPolicy() {
   // Retries until it lands: the status chip is already reporting the outage,

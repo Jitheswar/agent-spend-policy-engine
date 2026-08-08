@@ -27,7 +27,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from common import anchor, identity, policy_auth
+from common import anchor, identity, policy_auth, provisioning
 from common.avm_client import agent_address, agent_secret_key_b64, build_paying_session, load_accounts
 from policy_engine import policy_store, storage
 
@@ -49,7 +49,11 @@ app.add_middleware(
         "http://127.0.0.1:4023",
         "http://localhost:4023",
     ],
-    allow_methods=["GET", "POST", "PATCH"],
+    # DELETE is here for deregistering an agent. It's easy to add an endpoint
+    # and forget this list -- the browser then fails the preflight and the
+    # button does nothing, while curl against the same route works fine,
+    # which sends you looking in entirely the wrong place.
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
@@ -160,6 +164,109 @@ def update_agent_policy(agent_id: str, update: AgentPolicyUpdate):
     return {"agent_id": agent_id, **updated}
 
 
+class NewAgentRequest(BaseModel):
+    agent_id: str = Field(max_length=64, pattern=r"^[a-z0-9_]+$")
+    display_name: str = Field(max_length=64)
+    allowed_actions: list[str] = Field(default_factory=list)
+    per_request_limit_usd: float = Field(default=0.05, ge=0, le=1000)
+    daily_cap_usd: float = Field(default=0.50, ge=0, le=1000)
+    max_requests_per_minute: int | None = Field(default=15, ge=0, le=10000)
+    require_approval_above_usd: float | None = Field(default=None, ge=0, le=1000)
+    fund: bool = True
+
+
+@app.post("/admin/agents")
+def create_agent(req: NewAgentRequest):
+    """Onboard a new agent while the system is running -- no restart, no
+    config file editing, no redeploy.
+
+    Three things have to happen for a new agent to be real, and they happen
+    in this order for a reason:
+
+      1. It gets an Algorand keypair (common/provisioning.ensure_account).
+         Without its own key it cannot sign a /spend request, so the
+         identity check at the top of /spend would reject it -- there is no
+         path by which a keyless agent spends anything.
+      2. It's registered in policy with caps. This is what makes it
+         *governed*; it happens before any funding, so there is never a
+         window where an agent can pay for something no policy covers.
+      3. Its account is funded and opted into USDC on-chain, in the
+         background, so the response is immediate and the dashboard can
+         show it arriving.
+
+    Note what step 3 means for honesty about state: between the response and
+    the funding landing, the agent is registered and policy-governed but
+    cannot yet settle a payment. That's reported as
+    `provisioning.state == "funding"` on GET /agents rather than papered
+    over -- an agent that looks ready and then fails to pay is a worse
+    demo, and a worse system, than one that says what it's doing.
+    """
+    unknown_actions = [a for a in req.allowed_actions if a not in policy_store.get_policy()["actions"]]
+    if unknown_actions:
+        raise HTTPException(400, f"unknown action(s): {', '.join(unknown_actions)}")
+
+    try:
+        address, created = provisioning.ensure_account(req.agent_id)
+    except OSError as e:
+        raise HTTPException(500, f"could not create account: {e}")
+
+    try:
+        cfg = policy_store.add_agent(
+            req.agent_id,
+            req.display_name,
+            allowed_actions=req.allowed_actions,
+            per_request_limit_usd=req.per_request_limit_usd,
+            daily_cap_usd=req.daily_cap_usd,
+            max_requests_per_minute=req.max_requests_per_minute,
+            require_approval_above_usd=req.require_approval_above_usd,
+        )
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+    storage.append_event(
+        "agent.registered",
+        {
+            "agent_id": req.agent_id,
+            "display_name": req.display_name,
+            "address": address,
+            "new_account": created,
+            "allowed_actions": req.allowed_actions,
+            "per_request_limit_usd": req.per_request_limit_usd,
+            "daily_cap_usd": req.daily_cap_usd,
+        },
+    )
+
+    if req.fund:
+        provisioning.provision_async(
+            req.agent_id,
+            on_done=lambda agent_id, result, err: storage.append_event(
+                "agent.provisioned" if err is None else "agent.provision_failed",
+                {"agent_id": agent_id, **({"error": str(err)} if err else result)},
+            ),
+        )
+
+    anchor.maybe_auto_anchor()
+    return {
+        "agent_id": req.agent_id,
+        "address": address,
+        "new_account": created,
+        "provisioning": provisioning.get_status(req.agent_id),
+        **cfg,
+    }
+
+
+@app.delete("/admin/agents/{agent_id}")
+def delete_agent(agent_id: str):
+    """Deregister an agent. Keeps its key and its audit history -- see
+    policy_store.remove_agent for why neither is deleted."""
+    try:
+        policy_store.remove_agent(agent_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown agent '{agent_id}'")
+    storage.append_event("agent.deregistered", {"agent_id": agent_id})
+    return {"agent_id": agent_id, "removed": True}
+
+
 class FreezeRequest(BaseModel):
     frozen: bool
 
@@ -204,6 +311,11 @@ def list_agents():
                 "frozen": cfg.get("frozen", False),
                 "max_requests_per_minute": cfg.get("max_requests_per_minute"),
                 "require_approval_above_usd": cfg.get("require_approval_above_usd"),
+                # Present only for agents onboarded during this process's
+                # lifetime -- an agent still being funded is registered and
+                # governed but cannot settle yet, and the dashboard says so
+                # rather than letting an operator fire a doomed spend.
+                "provisioning": provisioning.get_status(agent_id),
                 "recent_requests": storage.count_recent_requests(agent_id, VELOCITY_WINDOW_SECONDS),
                 "daily_spend_usd": storage.get_daily_spend(agent_id, _today()),
                 "total_spend_usd": summary["total_spend_usd"],

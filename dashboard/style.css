@@ -1727,3 +1727,140 @@ main {
   .aurora { animation: none; }
   .agent-card:hover, .tile:hover, .btn:hover { transform: none; }
 }
+
+/* ----------------------------------------------------------------------
+   Live agent onboarding
+   ---------------------------------------------------------------------- */
+
+.btn-onboard {
+  border-color: rgba(34, 211, 238, 0.35);
+  background: rgba(34, 211, 238, 0.09);
+  color: #a5f3fc;
+  letter-spacing: 0.01em;
+}
+.btn-onboard:hover {
+  background: rgba(34, 211, 238, 0.16);
+  border-color: rgba(34, 211, 238, 0.6);
+}
+.btn-onboard.is-open {
+  background: rgba(34, 211, 238, 0.22);
+  border-color: rgba(34, 211, 238, 0.7);
+  color: #fff;
+}
+
+.onboard-panel {
+  margin: -4px 0 22px;
+  padding: 20px 22px;
+  border: 1px solid rgba(34, 211, 238, 0.28);
+  border-radius: var(--r-md);
+  background: linear-gradient(180deg, rgba(34, 211, 238, 0.07), rgba(18, 18, 32, 0.6));
+  animation: onboardIn 0.28s var(--ease) both;
+}
+@keyframes onboardIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.onboard-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 18px;
+  align-items: flex-end;
+}
+
+.onboard-field { display: flex; flex-direction: column; gap: 6px; flex: 1 1 190px; }
+.onboard-field-sm { flex: 0 1 110px; }
+.onboard-field > span {
+  font-size: 0.68rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.onboard-field input {
+  font-family: var(--font-body);
+  font-size: 0.86rem;
+  color: var(--text);
+  padding: 8px 11px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-hi);
+  background: rgba(6, 6, 13, 0.65);
+}
+.onboard-field input:focus-visible {
+  outline: none;
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.18);
+}
+
+.onboard-actions-field {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 14px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: rgba(6, 6, 13, 0.4);
+}
+.onboard-actions-field legend {
+  font-size: 0.68rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  padding: 0 6px;
+}
+.onboard-actions-field label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.84rem;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.onboard-actions-field input { accent-color: var(--cyan); }
+
+.onboard-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+  padding-top: 15px;
+  border-top: 1px solid var(--line);
+}
+.onboard-note { margin: 0; max-width: 54ch; font-size: 0.78rem; line-height: 1.55; color: var(--text-3); }
+.onboard-buttons { display: flex; gap: 10px; }
+
+.btn-primary {
+  border-color: transparent;
+  background: var(--brand-grad);
+  color: #08080f;
+  font-weight: 700;
+}
+.btn-primary:hover { filter: brightness(1.1); box-shadow: 0 10px 26px -10px rgba(99, 102, 241, 0.9); }
+
+/* A card whose funding hasn't confirmed yet: visibly mid-arrival, and its
+   Fire buttons are disabled (see patchAgentCard) because it genuinely
+   cannot settle a payment until the on-chain steps land. */
+.agent-card.is-provisioning {
+  border-color: rgba(251, 191, 36, 0.4) !important;
+  animation: provisionPulse 1.9s ease-in-out infinite;
+}
+@keyframes provisionPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0); }
+  50%      { box-shadow: 0 0 0 4px rgba(251, 191, 36, 0.12); }
+}
+.agent-card.is-provision-failed { border-color: rgba(251, 113, 133, 0.5) !important; }
+
+.btn-deregister {
+  width: 100%;
+  margin-top: 4px;
+  font-size: 0.76rem;
+  color: var(--text-3);
+  border: 1px solid var(--line);
+  background: transparent;
+}
+.btn-deregister:hover {
+  color: #fda4af;
+  border-color: rgba(251, 113, 133, 0.45);
+  background: rgba(251, 113, 133, 0.09);
+}

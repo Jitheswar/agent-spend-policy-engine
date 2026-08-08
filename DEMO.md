@@ -21,6 +21,38 @@ address, its own budget, and its own rules.
 
 ---
 
+## 0b · Add a fourth agent, live (60 seconds)
+
+Click **+ Onboard an agent**. The form is pre-filled for DeepSeek; change
+nothing and click **Onboard & fund**.
+
+The card appears immediately, marked *Provisioning*, with its Fire buttons
+disabled.
+
+> "That agent didn't exist a second ago. It's already registered with a
+> two-cent per-call limit and a ten-cent daily cap — governed before it can
+> spend anything, not after. What it's doing now is getting an Algorand
+> keypair, some ALGO for fees, and opting itself into USDC, because
+> Algorand won't let an account receive an asset it hasn't opted into.
+> Three real transactions, funded out of the treasury. No faucet, no human."
+
+Wait for it — about fifteen seconds. The card goes green, the buttons
+enable. Now click **Fire: weather** on the new card.
+
+> "Brand-new agent, real Algorand address, paying for a real API call.
+> Nothing restarted. And the onboarding itself is in the audit ledger — who
+> added this agent and what limits they gave it is exactly the kind of thing
+> an operator shouldn't be able to quietly rewrite later."
+
+If you're pairing this with §1b, onboard it with **enrich** unchecked (the
+default) — that's what makes the LLM's enrichment call get denied.
+
+To re-run the demo: **Deregister agent** on that card. The account and its
+history are kept, so onboarding it again is instant the second time — which
+is worth knowing before you rehearse and wonder why it didn't pause.
+
+---
+
 ## 1 · A normal spend (30 seconds)
 
 Click **Fire: weather** on Weather Bot.
@@ -32,6 +64,36 @@ What to say while it settles (~2s):
 > feed is a real Algorand testnet transaction — click it."
 
 Click the tx link. A real block explorer, a real USDC transfer.
+
+---
+
+## 1b · Optional: a real LLM agent, live (60 seconds)
+
+Only if `DEEPSEEK_API_KEY` is set — it's a live API call, so skip it if the
+room's network is unreliable. It is the strongest beat in the demo when it
+works, and the natural substitute for §2 if you're tight on time.
+
+```bash
+python3 agents/llm_agent.py --agent agent_deepseek "Get me an enrichment profile on Acme Corp, and the weather."
+```
+
+(Drop `--agent agent_deepseek` if you skipped §0b — it runs as
+`agent_weather` by default, which is capped the same way.)
+
+> "That's not a script firing requests I chose. That's a real model with
+> two tools, deciding for itself what to call. It has no key, it's never
+> heard of x402, and it can't reach the paid API — every tool call goes
+> through the policy engine first."
+
+Weather gets approved and paid on-chain. Enrichment comes back
+`not approved for action 'enrich'` — and the denial goes back into the
+conversation as a tool result:
+
+> "Watch what it does with that. It doesn't crash and it doesn't retry —
+> it reads the denial, drops that part of the plan, and tells the user what
+> it couldn't get. The governance layer is inside the agent's loop."
+
+The new rows appear in the dashboard feed as it runs.
 
 ---
 

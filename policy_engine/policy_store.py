@@ -77,13 +77,59 @@ def update_agent(agent_id: str, **fields) -> dict:
         if agent_id not in data["agents"]:
             raise KeyError(agent_id)
         data["agents"][agent_id].update(fields)
-        tmp_path = POLICY_PATH + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp_path, POLICY_PATH)  # atomic on POSIX
-        _cache["data"] = data
-        _cache["mtime"] = os.path.getmtime(POLICY_PATH)
+        _write_locked(data)
         return data["agents"][agent_id]
+
+
+def add_agent(agent_id: str, display_name: str, **fields) -> dict:
+    """Register a brand-new agent at runtime.
+
+    update_agent() deliberately refuses to change which agents exist -- that
+    guard is about a *policy edit* not quietly reshaping the roster. Adding
+    an agent is a different operation with a different audit event, so it
+    gets its own function rather than a loosened rule on that one.
+
+    The new agent starts with AGENT_DEFAULTS applied, meaning unfrozen and
+    unlimited on the two nullable controls, and whatever caps the caller
+    passed. Raises ValueError if the id is already taken -- silently
+    overwriting an existing agent's limits from a "create" call is how you
+    get a demo where someone's cap vanishes and nobody knows why.
+    """
+    unknown = set(fields) - MUTABLE_AGENT_FIELDS
+    if unknown:
+        raise ValueError(f"not settable: {', '.join(sorted(unknown))}")
+    with _lock:
+        data = _load_locked()
+        if agent_id in data["agents"]:
+            raise ValueError(f"agent '{agent_id}' already exists")
+        cfg = dict(AGENT_DEFAULTS)
+        cfg["display_name"] = display_name
+        cfg.update(fields)
+        data["agents"][agent_id] = cfg
+        _write_locked(data)
+        return cfg
+
+
+def remove_agent(agent_id: str) -> None:
+    """Deregister an agent. Its key stays in data/accounts.json and its
+    history stays in the audit ledger on purpose: the account may hold
+    testnet funds, and deleting an agent must not be a way to make what it
+    already spent disappear from the record."""
+    with _lock:
+        data = _load_locked()
+        if agent_id not in data["agents"]:
+            raise KeyError(agent_id)
+        del data["agents"][agent_id]
+        _write_locked(data)
+
+
+def _write_locked(data: dict) -> None:
+    tmp_path = POLICY_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, POLICY_PATH)  # atomic on POSIX
+    _cache["data"] = data
+    _cache["mtime"] = os.path.getmtime(POLICY_PATH)
 
 
 def set_frozen(agent_id: str, frozen: bool) -> dict:

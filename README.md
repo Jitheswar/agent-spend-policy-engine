@@ -129,6 +129,10 @@ x402 pattern (stable pricing per call).
   mints per approved spend and the resource server verifies.
 - **`agents/simulate.py`** — fires curated, repeatable sequences of
   *signed* requests, using key material it has legitimate local access to.
+- **`agents/llm_agent.py`** — a real LLM (DeepSeek) doing tool calls, where
+  every tool is a governed spend. See below.
+- **`common/provisioning.py`** — onboards a new agent at runtime: keypair,
+  ALGO for fees, USDC opt-in, working capital, all on-chain.
 - **`dashboard/`** — static HTML/JS mission control.
 
 ## The controls
@@ -202,6 +206,108 @@ python3 agents/simulate.py burst 25   # runaway agent -- trips the velocity limi
 ```
 
 See **[DEMO.md](DEMO.md)** for a five-minute walkthrough script.
+
+## Adding an agent while it's running
+
+The fleet isn't a fixed list compiled into the demo. **+ Onboard an agent**
+in the dashboard adds one live — no restart, no config file, no redeploy —
+and about fifteen seconds later it is paying for API calls on Algorand.
+
+Three things have to be true before a new agent is real, and they happen in
+this order for a reason:
+
+1. **It gets an Algorand keypair.** Without its own key it cannot sign a
+   `/spend` request, so the identity check rejects it. There is no path by
+   which a keyless agent spends anything.
+2. **It's registered in policy with caps** — per-call limit, daily cap,
+   rate limit, allowed actions. This happens *before* any funding, so there
+   is never a window in which an agent can pay for something no policy
+   covers.
+3. **Its account is funded and opted into USDC on-chain**, in the
+   background: ALGO for fees, then a USDC opt-in signed by the new agent
+   itself (Algorand requires an explicit opt-in before an account can
+   receive an asset), then working capital. Three real transactions, funded
+   from the server treasury — no faucet, no captcha, no human in the loop.
+
+During step 3 the agent is registered and governed but genuinely cannot
+settle a payment, so its card says which step it's on and its Fire buttons
+stay disabled. An agent that looks ready and then fails to pay is a worse
+demo, and a worse system, than one that says what it's doing.
+
+Same thing from the CLI:
+
+```bash
+curl -X POST http://127.0.0.1:4022/admin/agents -H 'Content-Type: application/json' \
+  -d '{"agent_id":"agent_deepseek","display_name":"DeepSeek Agent",
+       "allowed_actions":["weather"],"per_request_limit_usd":0.02,"daily_cap_usd":0.10}'
+```
+
+`DELETE /admin/agents/{id}` deregisters one. Its key stays in
+`data/accounts.json` and its history stays in the audit ledger, deliberately:
+the account may hold testnet funds, and deleting an agent must not be a way
+to make what it already spent disappear from the record. Re-onboarding the
+same id reuses the same account rather than stranding it.
+
+Both operations are audit events (`agent.registered`, `agent.provisioned`,
+`agent.deregistered`), so they're inside the hash chain and get anchored on
+Algorand like everything else — *who added an agent, with what limits, and
+when* is exactly the kind of thing an operator would otherwise be able to
+rewrite.
+
+**One thing to check before demoing this:** each onboard draws 0.5 ALGO and
+0.5 USDC out of the `server` account (tune with `PROVISION_ALGO` /
+`PROVISION_USDC`). Onboarding fails, visibly, if the treasury is empty.
+
+```bash
+python3 scripts/setup_accounts.py balances
+```
+
+## A real LLM agent under the policy
+
+`agents/simulate.py` fires requests a human picked in advance. That proves
+the engine works; it doesn't prove an *autonomous* agent is actually
+constrained by it. `agents/llm_agent.py` closes that gap: a real DeepSeek
+model, given ordinary tools, deciding for itself what to call.
+
+```bash
+export DEEPSEEK_API_KEY=sk-...
+python3 agents/llm_agent.py "Get me an enrichment profile on Acme Corp, and the weather."
+```
+
+The model gets two tools — `get_weather`, `enrich_company` — and nothing
+else. It has no Algorand key, never sees the resource server, and doesn't
+know x402 exists. Each tool call is routed through a signed `POST /spend`,
+and the value returned to the model is whatever the policy engine decided:
+
+| Decision | What the model receives |
+|---|---|
+| approved | the real API response, paid for on-chain, with the tx id |
+| denied | the denial reason, verbatim |
+| awaiting_approval | nothing — the agent **blocks** until a human clicks approve or reject in the dashboard |
+
+Both tools are always offered, whatever identity you run as. That's
+deliberate: the model is never prevented from *trying*, so anything that
+stops it is the policy engine and not this script. Running the command
+above as the default `agent_weather` — which is approved for weather only —
+is the demo worth watching: the enrichment call comes back
+`not approved for action 'enrich'`, that denial lands in the conversation
+as a tool result, and the model rewrites its plan and reports what it
+couldn't get. The governance layer is inside the agent's loop, not wrapped
+around it.
+
+```bash
+python3 agents/llm_agent.py --agent agent_rogue "Check the weather a few times."
+```
+
+`agent_rogue` has a $0.02 daily cap, so the model spends twice, gets cut
+off mid-task, and has to say so. Every spend and denial above is in the
+same audit ledger, anchored on Algorand, and `scripts/verify_audit.py`
+covers them exactly like any other.
+
+DeepSeek is used because its API is OpenAI-compatible, so this is plain
+`requests` against the standard chat-completions shape and adds no
+dependency. Point `DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL` at any compatible
+endpoint to swap the model out.
 
 ## Tests
 
