@@ -1,75 +1,160 @@
 # Agent Spend Policy Engine
 
-Autonomous agents try to spend money on paid APIs. A policy engine checks
-spend limits, approval rules, and daily caps *before* any payment is
-attempted. Every approved payment settles for real on **Algorand testnet**
-through the **x402** protocol (HTTP 402 -> pay -> retry -> 200).
+Autonomous agents try to spend money on paid APIs. A policy engine decides
+whether each spend is allowed *before* any payment is attempted. Approved
+spends settle for real on **Algorand testnet** via the **x402** protocol
+(HTTP 402 → pay → retry → 200). Every decision, allowed or blocked, is
+written to an **append-only hash-chained audit ledger whose head is
+notarized on Algorand** — so the record of what your agents did can be
+proven unedited by someone who doesn't trust you.
 
-## x402 + Algorand: what exists, what we built
+```bash
+./start.sh          # then open http://127.0.0.1:4023/index.html
+```
 
-x402 was built around EVM/USDC. Before writing any code we checked whether
-Algorand support already existed. It does:
+## Why this needs a blockchain
 
-- **GoPlausible** operates a public, live x402 facilitator with first-class
+Worth answering directly, because "we used a chain" is not a reason.
+
+Two independent things here are on-chain, and only one of them is about
+payments:
+
+**1. Settlement.** Agents pay per API call in testnet USDC through x402.
+Micropayments between software that has no prior relationship, no invoice,
+and no account is a genuinely awkward fit for card rails. That part is
+real, but it isn't the interesting part — plenty of projects stop here.
+
+**2. The audit trail itself.** This is the part that actually needs a
+chain. A spend-governance system's whole product is its record: *this
+agent was allowed to spend this, this one was stopped.* If that record
+lives only in the operator's database, then the operator can rewrite it,
+and every guarantee the system offers is worth exactly as much as your
+trust in whoever runs it. That's the failure mode governance software has
+to not have.
+
+So every decision is appended to a hash-chained ledger, and the chain head
+is periodically written into the note field of an Algorand transaction.
+After that, rewriting local history produces a ledger that disagrees with a
+hash sitting in a block nobody involved can edit — and anyone can check
+that themselves, against a public indexer, without trusting this codebase
+or the machine it runs on.
+
+That claim is checkable in about ten seconds:
+
+```bash
+python3 scripts/verify_audit.py
+```
+
+It reads the database directly (the services don't need to be running),
+recomputes every hash, then fetches each anchor's note back off the public
+AlgoNode indexer and compares. Exit code 0 only if the chain is intact
+**and** confirmed on-chain.
+
+There's also a button in the dashboard — *Tamper with a record* — that
+doctors a past audit entry the way a malicious operator would, recomputing
+that entry's own hash so the edit is internally consistent. Verification
+still catches it, and names the exact record.
+
+## x402 + Algorand: what already existed
+
+Before writing any code we checked whether Algorand support existed. It
+does, so we used it rather than rebuilding it:
+
+- **GoPlausible** runs a public, live x402 facilitator with first-class
   Algorand support: `https://facilitator.goplausible.xyz`. It verifies and
-  settles payments on Algorand testnet/mainnet (and Base, Solana).
+  settles on Algorand testnet/mainnet (and Base, Solana).
 - There's an official Python SDK on PyPI, **`x402-avm`**, with FastAPI
   server middleware and requests/httpx client integration. Algorand's x402
   spec extension is merged into Coinbase's x402 repo
   ([scheme_exact_algo.md](https://github.com/coinbase/x402/blob/main/specs/schemes/exact/scheme_exact_algo.md)).
 
-So we did **not** build a custom facilitator. We used the real one. The
-"exact" scheme pays in testnet USDC (an ASA, id `10458941`), not raw ALGO --
-that's the standard x402 pattern (stable pricing per call).
+We did **not** build a custom facilitator. The "exact" scheme pays in
+testnet USDC (an ASA, id `10458941`), not raw ALGO — that's the standard
+x402 pattern (stable pricing per call).
 
 ## Architecture
 
 ```
-Mock agents / Dashboard
-        |
-        v  POST /spend {agent_id, action}
-Policy Engine (:4022)  --- checks policy.json, logs to SQLite ---
-        |
-        v  (only if approved) GET <resource>, pays via x402 if 402'd
-Resource Server (:4021) --- x402 middleware, gated routes ---
-        |
-        v  verify() / settle()
-GoPlausible Facilitator (public, hosted)
-        |
-        v
-Algorand Testnet (real, verifiable transactions)
+ Mock agents (signed)        Dashboard (human operator)
+         |                            |
+         |  POST /spend               |  approve / reject / freeze / notarize
+         v                            v
+ ┌─────────────────────────────────────────────────┐
+ │  Policy Engine  :4022                           │
+ │                                                 │
+ │  identity → kill switch → allowed action →      │
+ │  per-request limit → velocity → daily cap →     │
+ │  human-approval threshold                       │
+ │                                                 │
+ │  every outcome ─┬─> requests    (operational)   │
+ │                 └─> audit_events (append-only,  │
+ │                      hash-chained)              │
+ └───────┬─────────────────────────────┬───────────┘
+         │ only if approved            │ chain head, periodically
+         v                             v
+ ┌──────────────────────┐      ┌──────────────────────┐
+ │ Resource Server :4021│      │  Algorand testnet    │
+ │  policy-auth gate    │      │  note: ASPE1|seq|hash│
+ │  x402 middleware     │      └──────────▲───────────┘
+ └───────┬──────────────┘                 │
+         │ verify() / settle()            │ independently readable
+         v                                │
+   GoPlausible facilitator ───> Algorand ─┘
 ```
 
-- **`resource_server/`** -- FastAPI app selling `/weather` ($0.01) and
-  `/enrich` ($0.05) behind two layers: `PolicyAuthMiddleware` (rejects any
-  request without a valid token from the policy engine -- see
-  [Known limitations](#known-limitations) #1) and the x402 payment
-  middleware. Knows nothing about spend policy; it just refuses to serve
-  anyone the policy engine hasn't already cleared.
-- **`policy_engine/`** -- the enforcement layer. `policy_store.py` reads
-  `policy.json` with mtime-based hot-reload (no restart needed -- see
-  limitation #4) and exposes `PATCH /admin/agents/{id}` for live edits that
-  persist back to the file. `POST /spend` checks policy, verifies the
-  caller's cryptographic signature (limitation #2), and only then calls the
-  resource server -- a denial never reaches it, so no payment is ever
-  attempted for a blocked request. Every outcome is written to
-  `data/policy_engine.db` (SQLite) as the audit trail.
-- **`common/avm_client.py`** -- shared Algorand signer + x402 paying
-  session, used by both the raw Phase 1 proof script and the policy
-  engine's payment step.
-- **`common/identity.py`** -- signs/verifies `/spend` requests with the
+- **`policy_engine/`** — the enforcement layer. `POST /spend` runs the
+  check chain above and only then calls the x402 payment loop. A denial
+  never reaches the resource server, so no payment is ever attempted for a
+  blocked request. `policy_store.py` hot-reloads `policy.json` on mtime
+  change and persists live edits back to it atomically.
+- **`policy_engine/storage.py`** — two tables, two jobs. `requests` is the
+  mutable operational view the dashboard reads. `audit_events` is the
+  append-only hash-chained ledger; nothing in the codebase updates or
+  deletes a row in it, including `/admin/reset`, which appends a
+  `audit.reset` event instead of truncating.
+- **`common/anchor.py`** — notarizes the chain head onto Algorand as a
+  0-ALGO self-payment carrying `ASPE1|<seq>|<hash>` in its note. Runs
+  automatically once enough events accumulate, on a background thread so no
+  `/spend` call ever waits on it.
+- **`resource_server/`** — FastAPI app selling `/weather` ($0.01) and
+  `/enrich` ($0.05) behind two layers: `PolicyAuthMiddleware` (rejects
+  anything without a valid token from the policy engine) and the x402
+  payment middleware. It knows nothing about spend policy; it just refuses
+  to serve anyone the engine hasn't cleared.
+- **`common/identity.py`** — signs/verifies `/spend` requests with the
   agent's own Algorand key (`algosdk.util.sign_bytes`/`verify_bytes`),
   domain-separated from transaction signing. Replay-guarded (nonce + 60s
   window).
-- **`common/policy_auth.py`** -- the shared-secret HMAC token the policy
-  engine mints per approved spend and the resource server verifies before
-  serving anything.
-- **`agents/simulate.py`** -- fires a curated, repeatable sequence of
-  *signed* requests (mix of approvals and denials) at the policy engine,
-  using key material it has legitimate local access to.
-- **`dashboard/`** -- static HTML/JS. Live agent cards (spend, caps, fire
-  buttons with editable amounts), live request feed with clickable Algorand
-  testnet explorer links, autoplay toggle, and a demo-log reset button.
+- **`common/policy_auth.py`** — the shared-secret HMAC token the engine
+  mints per approved spend and the resource server verifies.
+- **`agents/simulate.py`** — fires curated, repeatable sequences of
+  *signed* requests, using key material it has legitimate local access to.
+- **`dashboard/`** — static HTML/JS mission control.
+
+## The controls
+
+Every check below runs on every `/spend`, in this order. Order matters and
+is tested: identity is verified before any policy statement about an agent
+is evaluated, and the kill switch is checked before every budget rule.
+
+| Check | Denial code | What it's for |
+|---|---|---|
+| Known agent / known action | `unknown_agent`, `unknown_action` | Nothing unregistered spends |
+| **Cryptographic identity** | `identity_failed` | Caller controls that agent's Algorand key. Replay-guarded, 60s TTL |
+| **Kill switch** | `frozen` | Stop an agent *now*, regardless of remaining budget |
+| Allowed action | `action_not_allowed` | This agent may call this API at all |
+| Per-request limit | `over_per_request_limit` | Bound any single call |
+| **Velocity** | `over_velocity_limit` | Bound the *rate*. A daily cap doesn't stop a retry loop burning it in seconds |
+| Daily cap | `over_daily_cap` | Bound the day. Atomically reserved, so concurrent calls can't both slip under |
+| **Human approval threshold** | `awaiting_approval` | Above this, policy alone can't authorize — a person must release it |
+
+The last one parks the request holding its budget, so a queued approval
+can't be double-spent against while it waits. Freezing an agent while a
+hold is queued blocks the release too — otherwise the kill switch would
+have a queue-shaped hole in it.
+
+Per-agent config lives in `policy_engine/policy.json` and is editable live
+(`PATCH /admin/agents/{id}`, or just edit the file — it hot-reloads).
 
 ## Setup + run
 
@@ -79,46 +164,44 @@ Algorand Testnet (real, verifiable transactions)
 
 One command: creates the venv, installs dependencies, generates the four
 Algorand testnet accounts (`data/accounts.json`, gitignored, testnet-only)
-if they don't exist yet, checks/opts them into testnet USDC, then starts
-all three services -- resource server (`:4021`), policy engine (`:4022`),
-dashboard (`:4023`). Safe to re-run any time; it only creates what's
-missing and always (re)starts the services fresh. Open
-http://127.0.0.1:4023/index.html.
+if missing, checks/opts them into testnet USDC, then starts all three
+services — resource server (`:4021`), policy engine (`:4022`), dashboard
+(`:4023`). Safe to re-run; it only creates what's missing.
 
 Once every account is confirmed funded and opted in, a `data/.setup_verified`
-marker is written and every later `./start.sh` skips the on-chain
-balance/opt-in checks entirely -- those are real network round-trips
-against the public AlgoNode testnet API (occasionally multiple seconds per
-call), and re-runing them on every startup when nothing's changed is what
-made `./start.sh` feel slow. Run `./start.sh --recheck` (or delete
-`data/.setup_verified`) to force the checks again -- e.g. after re-funding
-an account.
+marker is written and later runs skip the on-chain balance/opt-in checks —
+those are real network round-trips against public AlgoNode, occasionally
+multiple seconds each. Run `./start.sh --recheck` (or delete
+`data/.setup_verified`) to force them again — e.g. after re-funding an
+account.
 
 ### Funding the accounts (one-time, needs a human)
 
-The first `./start.sh` run generates the accounts but they start with zero
-balance -- payments will fail until funded:
+The first run generates accounts with zero balance; payments fail until
+funded:
 
-1. ALGO (small amounts, just for opt-in fees/min-balance): the official
+1. **ALGO** (for fees/min-balance, and for anchoring): the official
    Algorand TestNet Dispenser at https://bank.testnet.algorand.network/
-   (Google login + captcha -- a human has to do this step).
-2. Testnet USDC (what the payments actually happen in): **faucet.circle.com**
-   -> select Algorand testnet -> request for each `agent_*` address. The
-   `server` address never needs USDC, it only receives it.
+   (Google login + captcha, so a human has to do this).
+2. **Testnet USDC** (what payments actually happen in): **faucet.circle.com**
+   → Algorand testnet → request for each `agent_*` address. The `server`
+   address needs ALGO (it pays anchoring fees) but never needs USDC.
 
-Re-run `./start.sh` after funding -- it'll pick up the balances and opt
-every account into USDC automatically. Or check manually:
+Re-run `./start.sh` after funding. Or check manually:
 
 ```bash
 python3 scripts/setup_accounts.py balances
 ```
 
-Or fire scenarios from the CLI instead of/alongside the dashboard:
+Fire scenarios from the CLI instead of the dashboard:
 
 ```bash
-python3 agents/simulate.py once       # one pass through the curated scenario list
+python3 agents/simulate.py once       # one pass through the curated scenarios
 python3 agents/simulate.py loop 4     # repeat every 4s
+python3 agents/simulate.py burst 25   # runaway agent -- trips the velocity limiter
 ```
+
+See **[DEMO.md](DEMO.md)** for a five-minute walkthrough script.
 
 ## Tests
 
@@ -126,109 +209,120 @@ python3 agents/simulate.py loop 4     # repeat every 4s
 pytest tests/ -v
 ```
 
-- `test_policy_engine.py` -- policy decisions (unknown agent/action,
-  per-request limit, daily cap), the daily-cap concurrency fix (12
-  simultaneous reservations against a cap with room for 2, asserts exactly
-  2 succeed), and the signed-identity denial paths (impersonation, replay)
-  at the HTTP layer.
-- `test_identity.py` -- unit tests for request signing/verification:
-  wrong-key impersonation, tampered amount/action, expired timestamp,
-  replay, malformed signature.
-- `test_policy_auth.py` -- unit tests for the resource-server auth token:
-  wrong action, tampered signature, expired, malformed.
-- `test_policy_store.py` -- hot-reload on file edit, live `PATCH` persists
-  to disk and is immediately visible.
+75 tests, no network required (anchoring is disabled process-wide in
+`tests/conftest.py`, so a unit-test run never submits a transaction).
+
+- `test_policy_engine.py` — policy decisions, the daily-cap concurrency fix
+  (12 simultaneous reservations against a cap with room for 2, asserts
+  exactly 2 succeed), reservation-leak handling, and signed-identity denial
+  paths at the HTTP layer.
+- `test_audit_ledger.py` — the hash chain accepts an honest ledger and
+  rejects a doctored one, including the *competent* tamper where the
+  attacker recomputes the edited entry's own hash. Also covers the case
+  that justifies anchoring at all: a fully-rewritten chain that verifies
+  locally and still fails against its anchor.
+- `test_governance.py` — kill switch, velocity limiting, approval holds
+  (budget held while queued, freed on reject, blocked if the agent is
+  frozen mid-queue, not approvable twice).
+- `test_identity.py` — request signing/verification: wrong-key
+  impersonation, tampered amount/action, expired timestamp, replay,
+  malformed signature.
+- `test_policy_auth.py` — resource-server token: wrong action, tampered
+  signature, expired, malformed.
+- `test_policy_store.py` — hot-reload on file edit, live `PATCH` persists.
 
 Doesn't cover the approval path end-to-end (that needs a live facilitator +
-funded testnet accounts -- see `scripts/phase1_client.py` for that proof
-instead).
-
-To prove the raw payment loop in isolation (no policy engine):
-
-```bash
-python3 scripts/phase1_client.py
-```
+funded testnet accounts — see `scripts/phase1_client.py` for that proof).
 
 ## Known limitations
 
-Four gaps were raised during review. Three are fixed; one is a documented,
-deliberate tradeoff.
+Honest accounting. Some are fixed, some are deliberate tradeoffs, and one
+is inherent.
 
 **1. Resource server could be called directly, bypassing policy.** Fixed.
-`resource_server`'s `PolicyAuthMiddleware` rejects (403) any request to
-`/weather` or `/enrich` that doesn't carry a valid, unexpired HMAC token
-(`common/policy_auth.py`) minted by the policy engine after a spend clears.
-Verified live: a direct `curl` with no token gets 403 before ever seeing a
-402; a tampered or wrong-action token gets 403; the real policy-engine flow
+`PolicyAuthMiddleware` rejects (403) any request to `/weather` or `/enrich`
+without a valid, unexpired HMAC token minted by the policy engine after a
+spend clears. Verified live: a direct `curl` with no token gets 403 before
+ever seeing a 402; a tampered or wrong-action token gets 403; the real flow
 still works (the header survives the x402 client's internal 402-retry).
-**Honest scope**: this is a shared static secret on local disk, not network
-isolation. A production deployment would put the resource server on a
-network only the policy engine can reach (or use mTLS) rather than trust a
-secret both processes happen to read off the same disk. It closes "pay the
-resource server directly with your own funded wallet," not every possible
-bypass of a determined attacker with filesystem access.
+**Scope:** this is a shared static secret on local disk, not network
+isolation. Production would put the resource server on a network only the
+engine can reach, or use mTLS. It closes "pay the resource server directly
+with your own funded wallet", not every bypass available to an attacker
+with filesystem access.
 
 **2. Agent identity wasn't cryptographically verified.** Mostly fixed.
-`POST /spend` now requires a signature over `(agent_id, action, amount_usd,
+`/spend` requires a signature over `(agent_id, action, amount_usd,
 timestamp, nonce)`, verified with `algosdk.util.verify_bytes` against the
-agent's known Algorand address (`common/identity.py`). Replay-guarded (a
-signature can't be reused) and TTL-bounded (60s). Verified live: signing
-with the wrong agent's key, tampering the amount after signing, and
-replaying a valid signature are all rejected with distinct, correct
-reasons; the real approval flow still settles real payments.
-**Honest scope**: in this demo the policy engine already holds every
-agent's private key custodially (that's how it signs their payments) --
-there's no separate process where each agent independently holds a key
-nobody else touches. `agents/simulate.py` signs for real with key material
-it legitimately has local access to, the same way a genuine autonomous
-agent process would. The dashboard's Fire buttons are a human operator, not
-a separate cryptographic identity, so they go through `POST /admin/sign` --
-a clearly-labeled convenience endpoint using the same custodial keys,
-explicitly not something a real external agent would ever call. What this
-proves: `/spend` rejects any caller outside this system who doesn't possess
-an agent's private key. What it doesn't prove: that the dashboard operator
-*is* the agent -- it isn't, and isn't claiming to be.
+agent's known address. Replay-guarded and TTL-bounded.
+**Scope:** in this demo the engine already holds every agent's key
+custodially (that's how it signs their payments), so there's no separate
+process holding a key nobody else touches. `agents/simulate.py` signs for
+real with key material it legitimately has, like a genuine agent would. The
+dashboard's Fire buttons are a human operator, not a cryptographic
+identity, so they go through `POST /admin/sign` — a clearly-labeled
+convenience endpoint, explicitly not something a real agent would call.
+What this proves: `/spend` rejects any caller who doesn't possess an
+agent's private key. What it doesn't: that the dashboard operator *is* the
+agent — it isn't, and doesn't claim to be.
 
-**3. The x402 facilitator is a single point of failure.** Not fixed --
-deliberately. The `x402-avm` SDK does support self-hosting a facilitator
-(`x402.mechanisms.avm.exact.ExactAvmFacilitatorScheme`), so a local
-facilitator with GoPlausible's hosted one as fallback was a real option.
-Decided against it: it doesn't actually eliminate the SPOF, it just moves
-it to a process running on the same machine as everything else here, for
-the cost of a 5th funded Algorand account and meaningfully more moving
-parts. Genuine redundancy needs independently-hosted infrastructure, which
-is out of scope for a hackathon demo. If `facilitator.goplausible.xyz` is
-down, every payment in this system fails -- there is no failover.
+**3. A hash chain cannot detect an edit to its own last entry.** Inherent,
+not a bug, and worth stating rather than glossing. Nothing follows the head
+entry to disagree with it, and a tamperer who recomputes its hash leaves
+something wholly self-consistent — `verify_chain()` will pass. Only an
+anchor closes this, and only once one exists. That's precisely why
+anchoring is automatic rather than manual: the exposure window is "events
+appended since the last anchor", bounded by `AUTO_ANCHOR_THRESHOLD`
+(default 8). The demo's tamper button deliberately avoids picking the head
+entry when anything else is available — triggering the one case the
+detector genuinely can't see would be a dishonest demo.
 
-Observed directly while testing this: the public facilitator and AlgoNode
-testnet endpoints occasionally show multi-second, sometimes 30+ second,
-latency (confirmed independently with plain `curl` against AlgoNode's
-`/v2/status` -- not an artifact of this codebase). One `/spend` call timed
-out mid-payment during testing; it correctly resolved to `denied` rather
-than getting stuck (the reservation-leak fix earlier in this session
-holding up under a real failure, not just a synthetic one) but it's a
-concrete example of what this SPOF costs: a slow-but-not-actually-broken
-external dependency looks identical to a real denial from the caller's
-side. The policy engine's outbound timeout is 60s to give genuinely slow
-(rather than dead) round trips room to complete instead of manufacturing
-false denials, but that's a mitigation, not a fix -- it just moves where
-the line is.
+**4. The x402 facilitator is a single point of failure.** Not fixed,
+deliberately. `x402-avm` does support self-hosting a facilitator, so a
+local one with GoPlausible as fallback was a real option. We decided
+against it: it doesn't eliminate the SPOF, it moves it to a process on the
+same machine as everything else, for the cost of a fifth funded account and
+meaningfully more moving parts. Genuine redundancy needs independently
+hosted infrastructure, which is out of scope here. If
+`facilitator.goplausible.xyz` is down, every payment fails.
 
-**4. `policy.json` needed a restart to take effect.** Fixed.
-`policy_engine/policy_store.py` checks the file's mtime on every read and
-reloads if it changed -- hand-edit the file and it takes effect on the next
-request. `PATCH /admin/agents/{agent_id}` (body:
-`{"per_request_limit_usd"?, "daily_cap_usd"?, "allowed_actions"?}`) edits
-live and persists back to `policy.json` atomically (write-temp-then-rename),
-so changes survive a restart too. Verified: a direct file edit and an API
-edit are both picked up without touching either running process.
+Observed while testing: the public facilitator and AlgoNode endpoints
+occasionally show multi-second, sometimes 30+ second latency (confirmed
+independently with plain `curl` against AlgoNode's `/v2/status` — not an
+artifact of this codebase). One `/spend` timed out mid-payment during
+testing and correctly resolved to `denied` rather than getting stuck, but
+it's a concrete example of what this SPOF costs: slow-but-alive looks
+identical to a real denial from the caller's side. The outbound timeout is
+60s to give genuinely slow round trips room instead of manufacturing false
+denials — a mitigation, not a fix.
+
+**5. `policy.json` needed a restart to take effect.** Fixed.
+`policy_store.py` checks mtime on every read and reloads if changed.
+`PATCH /admin/agents/{agent_id}` edits live and persists back atomically
+(write-temp-then-rename), so changes survive a restart too.
+
+**6. Anchoring costs a real transaction fee.** 0.001 ALGO per anchor, paid
+by the `server` account. At the default threshold that's roughly one
+transaction per 8 decisions. A production deployment would batch harder
+(anchor every N minutes rather than every N events) and probably commit a
+Merkle root over a batch rather than a running chain head.
 
 ## Verifying it's real
 
 Every approved request returns an Algorand testnet transaction ID and an
-explorer link (`https://lora.algokit.io/testnet/transaction/<txid>`). You
-can also check any transaction independently against the public indexer:
+explorer link (`https://lora.algokit.io/testnet/transaction/<txid>`). Check
+any of them independently against the public indexer:
 
 ```bash
 curl -s "https://testnet-idx.algonode.cloud/v2/transactions/<txid>" | python3 -m json.tool
 ```
+
+And to read an audit anchor's committed hash straight off the chain:
+
+```bash
+curl -s "https://testnet-idx.algonode.cloud/v2/transactions/<anchor_txid>" \
+  | python3 -c "import sys,json,base64; print(base64.b64decode(json.load(sys.stdin)['transaction']['note']).decode())"
+```
+
+That prints `ASPE1|<seq>|<hash>` — the hash the ledger reported at that
+point, recorded in a block, readable by anyone.

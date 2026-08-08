@@ -19,8 +19,9 @@ firing, so a live demo always shows the same clean mix of approvals and
 denials instead of relying on luck.
 
 Usage:
-    python agents/simulate.py once       # fire the whole sequence once, then exit
-    python agents/simulate.py loop 4     # fire the sequence on repeat, 4s between calls
+    python agents/simulate.py once            # fire the whole sequence once, then exit
+    python agents/simulate.py loop 4          # fire the sequence on repeat, 4s between calls
+    python agents/simulate.py burst 25        # a runaway agent: 25 requests as fast as possible
 """
 
 import os
@@ -83,6 +84,31 @@ def run_once():
         print(line)
 
 
+def run_burst(agent_id: str, action: str, count: int):
+    """A runaway agent: the same request, as fast as the loop can issue it.
+
+    This is the failure mode an autonomous agent actually has -- not "spends
+    too much on one call" but "gets stuck and issues a correct call ten
+    thousand times". Every request here is individually within the
+    per-request limit, so nothing but the velocity limiter stops it, which
+    is exactly the point of demonstrating it separately.
+    """
+    accounts = load_accounts()
+    policy = requests.get(f"{POLICY_ENGINE_URL}/policy", timeout=10).json()
+    action_prices = {name: cfg["price_usd"] for name, cfg in policy["actions"].items()}
+
+    tally: dict[str, int] = {}
+    for i in range(count):
+        result = fire(agent_id, action, accounts, action_prices)
+        decision = result["decision"]
+        tally[decision] = tally.get(decision, 0) + 1
+        print(f"  [{i + 1:3d}/{count}] {decision.upper():18s} {result['reason'][:88]}")
+
+    print("\n" + "-" * 60)
+    print(f"  {count} requests fired: " + ", ".join(f"{n} {d}" for d, n in sorted(tally.items())))
+    print("  Nothing here exceeded a per-request limit -- the limiter stopped the RATE.")
+
+
 def run_loop(interval: float):
     print(f"Looping scenarios every {interval}s. Ctrl+C to stop.")
     try:
@@ -101,6 +127,14 @@ if __name__ == "__main__":
     elif mode == "loop":
         interval = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
         run_loop(interval)
+    elif mode == "burst":
+        count = int(sys.argv[2]) if len(sys.argv) > 2 else 25
+        # agent_weather by default: its daily cap ($1.00) is deliberately
+        # roomy, so the velocity limiter is unambiguously the thing that
+        # stops the burst rather than the budget quietly running out.
+        agent_id = sys.argv[3] if len(sys.argv) > 3 else "agent_weather"
+        action = sys.argv[4] if len(sys.argv) > 4 else "weather"
+        run_burst(agent_id, action, count)
     else:
         print(__doc__)
         sys.exit(1)

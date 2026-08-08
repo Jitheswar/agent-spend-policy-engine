@@ -52,7 +52,11 @@ fi
 echo "==> Stopping any previous instances..."
 pkill -f "uvicorn resource_server.main:app" 2>/dev/null || true
 pkill -f "uvicorn policy_engine.app:app" 2>/dev/null || true
+# Both dashboard server names: `http.server 4023` is what older runs of this
+# script left behind, and dashboard/serve.py is what it starts now. Missing
+# the stale one means the new server dies on "address already in use".
 pkill -f "http.server 4023" 2>/dev/null || true
+pkill -f "dashboard/serve.py" 2>/dev/null || true
 sleep 1
 
 echo "==> Starting resource server on :4021 ..."
@@ -64,16 +68,24 @@ nohup uvicorn policy_engine.app:app --host 127.0.0.1 --port 4022 > /tmp/policy_e
 PE_PID=$!
 
 echo "==> Starting dashboard on :4023 ..."
-(cd dashboard && exec python3 -m http.server 4023) > /tmp/dashboard.log 2>&1 &
+# dashboard/serve.py, not `python3 -m http.server`: the stdlib server sends
+# Last-Modified and no Cache-Control, so browsers heuristically cache
+# app.js and can serve a stale copy without revalidating. A half-updated
+# dashboard during a demo is invisible and unfixable in the moment.
+python3 dashboard/serve.py 4023 > /tmp/dashboard.log 2>&1 &
 DASH_PID=$!
 
 trap "echo; echo Stopping...; kill $RS_PID $PE_PID $DASH_PID 2>/dev/null; true" EXIT INT TERM
 
 sleep 2
 echo ""
-echo "Resource server : http://127.0.0.1:4021/health"
+echo "Dashboard        : http://127.0.0.1:4023/index.html   <- start here"
 echo "Policy engine    : http://127.0.0.1:4022/health"
-echo "Dashboard        : http://127.0.0.1:4023/index.html"
+echo "Resource server  : http://127.0.0.1:4021/health"
+echo ""
+echo "Demo walkthrough : DEMO.md  (five minutes, scripted)"
+echo "Verify the audit ledger against Algorand, without trusting any of the above:"
+echo "  python3 scripts/verify_audit.py"
 echo ""
 echo "Logs: /tmp/resource_server.log /tmp/policy_engine.log /tmp/dashboard.log"
 echo "Ctrl+C to stop all three."
