@@ -4,34 +4,241 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Agent Spend Policy Engine</title>
-  <link rel="icon" href="data:," />
-  <link rel="stylesheet" href="style.css" />
+  <meta name="description" content="Mission control for autonomous agent spending on Algorand." />
+  <!-- Inline SVG favicon: a shield with a coin slot, matching the brand mark. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%2322d3ee'/%3E%3Cstop offset='1' stop-color='%23a855f7'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M16 2 5 6.5v9c0 7 4.7 12.6 11 14.5 6.3-1.9 11-7.5 11-14.5v-9L16 2Z' fill='url(%23g)'/%3E%3Crect x='11' y='13' width='10' height='3' rx='1.5' fill='%23090912'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <!-- ?v= is a cache buster, and it is load-bearing rather than
+       superstition. dashboard/serve.py now sends `no-store`, but that only
+       governs responses from here on: a browser that already cached app.js
+       under the old `python3 -m http.server` (which sent Last-Modified and
+       no Cache-Control, so browsers invented their own freshness window)
+       will keep reusing that copy on a normal reload without ever asking
+       the server again. Only a different URL evicts it. Bump this when
+       shipping a change someone may already have an old copy of. -->
+  <link rel="stylesheet" href="style.css?v=2" />
 </head>
 <body>
+  <!-- Slow-drifting aurora + grid backdrop. Purely decorative, transform-only
+       animations so it never costs layout, and fully disabled under
+       prefers-reduced-motion. -->
+  <div class="aurora" aria-hidden="true">
+    <span class="blob blob-1"></span>
+    <span class="blob blob-2"></span>
+    <span class="blob blob-3"></span>
+  </div>
+  <div class="grid-overlay" aria-hidden="true"></div>
+
   <header class="topbar">
-    <div class="topbar-title">
-      <h1>Agent Spend Policy Engine</h1>
-      <span class="badge"><span class="badge-dot"></span>Algorand Testnet &middot; x402</span>
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" fill="none">
+          <path d="M16 2 5 6.5v9c0 7 4.7 12.6 11 14.5 6.3-1.9 11-7.5 11-14.5v-9L16 2Z"
+                fill="url(#shieldGrad)" />
+          <path d="M16 2 5 6.5v9c0 7 4.7 12.6 11 14.5 6.3-1.9 11-7.5 11-14.5v-9L16 2Z"
+                stroke="rgba(255,255,255,.35)" stroke-width="1" />
+          <rect x="11" y="13.5" width="10" height="3" rx="1.5" fill="#07070f" />
+          <defs>
+            <linearGradient id="shieldGrad" x1="5" y1="2" x2="27" y2="30" gradientUnits="userSpaceOnUse">
+              <stop stop-color="#22d3ee" />
+              <stop offset="1" stop-color="#a855f7" />
+            </linearGradient>
+          </defs>
+        </svg>
+      </span>
+      <div class="brand-text">
+        <h1>Agent Spend <span>Policy Engine</span></h1>
+        <p>Autonomous payments, kept on a leash</p>
+      </div>
     </div>
+
+    <div class="topbar-meta">
+      <span class="chip chip-live" id="statusChip"><span class="live-dot"></span><span id="statusLabel">Connecting&hellip;</span></span>
+      <span class="chip chip-proto">x402</span>
+    </div>
+
     <div class="topbar-actions">
-      <label class="autoplay">
+      <label class="switch" title="Fire a curated loop of approve/deny scenarios">
         <input type="checkbox" id="autoplayToggle" />
-        Autoplay demo traffic
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+        <span class="switch-label">Autopilot</span>
       </label>
-      <button id="resetBtn" class="btn btn-ghost" title="Clears the local audit log only, no on-chain effect">
-        Reset demo log
+
+      <button id="sfxBtn" class="icon-btn" type="button" aria-pressed="false" title="Toggle verdict sound effects">
+        <svg class="ico-sound-on" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 5 6 9H3v6h3l5 4V5Z" />
+          <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+          <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+        </svg>
+        <svg class="ico-sound-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 5 6 9H3v6h3l5 4V5Z" />
+          <path d="m16 9 5 6M21 9l-5 6" />
+        </svg>
+      </button>
+
+      <button id="resetBtn" class="btn btn-ghost" type="button" title="Clears the local audit log only, no on-chain effect">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5" />
+        </svg>
+        Reset log
       </button>
     </div>
   </header>
 
   <main>
-    <p class="section-label">Agents</p>
+    <!-- Command bar: aggregate view across every agent. -->
+    <section class="hero" aria-label="Fleet totals">
+      <article class="tile tile-good">
+        <div class="tile-top">
+          <span class="tile-label">Authorized</span>
+          <span class="tile-glyph">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 12.5 5 5L20 6.5"/></svg>
+          </span>
+        </div>
+        <div class="tile-value" id="statSpend">$0.00</div>
+        <div class="tile-sub"><b id="statApproved">0</b> approvals cleared policy</div>
+      </article>
+
+      <article class="tile tile-bad">
+        <div class="tile-top">
+          <span class="tile-label">Blocked</span>
+          <span class="tile-glyph">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="m6.5 6.5 11 11"/></svg>
+          </span>
+        </div>
+        <div class="tile-value" id="statDenied">0</div>
+        <div class="tile-sub">spends stopped before any payment</div>
+      </article>
+
+      <article class="tile tile-chain">
+        <div class="tile-top">
+          <span class="tile-label">Settled on-chain</span>
+          <span class="tile-glyph">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/><path d="M10 6.5h4a3 3 0 0 1 3 3V14"/></svg>
+          </span>
+        </div>
+        <div class="tile-value" id="statTx">0</div>
+        <div class="tile-sub">testnet USDC transactions in feed</div>
+      </article>
+
+      <article class="tile tile-rate">
+        <div class="tile-top">
+          <span class="tile-label">Approval rate</span>
+          <span class="tile-glyph">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V9M10 19V5M16 19v-6M22 19H2"/></svg>
+          </span>
+        </div>
+        <div class="tile-value" id="statRate">&mdash;</div>
+        <div class="tile-sub">
+          <span class="split-bar"><span class="split-fill" id="statRateFill"></span></span>
+        </div>
+      </article>
+
+      <article class="pulse-card">
+        <div class="pulse-head">
+          <span class="pulse-title">Decision pulse</span>
+          <span class="pulse-legend">
+            <i class="key key-approved"></i>approved
+            <i class="key key-denied"></i>denied
+            <i class="key key-pending"></i>pending
+          </span>
+        </div>
+        <div class="pulse-strip" id="pulseStrip"></div>
+      </article>
+    </section>
+
+    <!-- The differentiator. Every decision above is appended to a
+         hash-chained ledger whose head is notarized on Algorand, so the
+         record can be proven unedited by someone who doesn't trust
+         whoever runs this process. -->
+    <div class="section-head">
+      <p class="section-label"><span class="section-num">01</span>Audit integrity</p>
+      <span class="section-hint">append-only ledger &middot; notarized on Algorand</span>
+    </div>
+
+    <section class="integrity" id="integrity">
+      <div class="integrity-verdict">
+        <span class="integrity-shield" id="integrityShield">
+          <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M16 3 6 7v8.5c0 6.4 4.3 11.5 10 13.5 5.7-2 10-7.1 10-13.5V7L16 3Z" />
+            <path class="shield-tick" d="m11.5 16 3.2 3.2 6.3-6.6" />
+            <path class="shield-bang" d="M16 10.5v7M16 21.5v.2" />
+          </svg>
+        </span>
+        <div class="integrity-headline">
+          <div class="integrity-state" id="integrityState">Checking&hellip;</div>
+          <p class="integrity-detail" id="integrityDetail">Recomputing the hash chain&hellip;</p>
+        </div>
+      </div>
+
+      <div class="integrity-facts">
+        <div class="fact">
+          <span class="fact-label">Ledger events</span>
+          <span class="fact-value" id="integrityEvents">&mdash;</span>
+        </div>
+        <div class="fact">
+          <span class="fact-label">Chain head</span>
+          <span class="fact-value mono" id="integrityHead">&mdash;</span>
+        </div>
+        <div class="fact">
+          <span class="fact-label">Last notarized</span>
+          <span class="fact-value" id="integrityAnchor">&mdash;</span>
+        </div>
+      </div>
+
+      <div class="integrity-actions">
+        <button id="anchorBtn" class="btn btn-anchor" type="button"
+                title="Write the current chain head into an Algorand testnet transaction">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="5" r="2.5"/><path d="M12 7.5V21M6 11H18M5 15a7 7 0 0 0 14 0"/>
+          </svg>
+          Notarize on Algorand
+        </button>
+        <button id="tamperBtn" class="btn btn-danger" type="button"
+                title="Demo only: doctor a past audit record the way a malicious operator would">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 21h18M5 21V10l7-6 7 6v11"/><path d="m9 13 6 5M15 13l-6 5"/>
+          </svg>
+          Tamper with a record
+        </button>
+        <button id="restoreBtn" class="btn btn-ghost" type="button" hidden
+                title="Put the doctored record back, byte for byte">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/>
+          </svg>
+          Undo tamper
+        </button>
+      </div>
+    </section>
+
+    <div class="section-head">
+      <p class="section-label"><span class="section-num">02</span>Agent fleet</p>
+      <span class="section-hint">live policy state &middot; refreshed every 2s</span>
+    </div>
     <section id="agents" class="agents-grid"></section>
 
-    <div class="feed-section-head">
-      <p class="section-label" style="margin-bottom: 0;">Live Request Feed</p>
-      <span class="feed-count" id="feedCount"></span>
+    <!-- Only rendered when something is actually waiting; an empty
+         approvals queue is noise, not information. -->
+    <div class="section-head" id="approvalsHead" hidden>
+      <p class="section-label"><span class="section-num">03</span>Awaiting your approval</p>
+      <span class="section-hint">above threshold &middot; budget held until you decide</span>
     </div>
+    <section id="approvals" class="approvals-grid" hidden></section>
+
+    <div class="section-head">
+      <p class="section-label"><span class="section-num" id="feedNum">04</span>Live request feed</p>
+      <div class="feed-controls">
+        <div class="filter-group" id="feedFilters" role="group" aria-label="Filter feed by decision">
+          <button class="filter-btn is-active" data-filter="all" type="button">All</button>
+          <button class="filter-btn" data-filter="approved" type="button">Approved</button>
+          <button class="filter-btn" data-filter="denied" type="button">Denied</button>
+        </div>
+        <span class="feed-count" id="feedCount">0 requests</span>
+      </div>
+    </div>
+
     <div class="feed-table-wrap">
       <table class="feed-table">
         <thead>
@@ -39,7 +246,7 @@
             <th>Time</th>
             <th>Agent</th>
             <th>Action</th>
-            <th>Amount</th>
+            <th class="num">Amount</th>
             <th>Decision</th>
             <th>Reason</th>
             <th>Algorand Tx</th>
@@ -48,8 +255,14 @@
         <tbody id="feedBody"></tbody>
       </table>
     </div>
+
+    <footer class="page-foot">
+      <span>Policy is enforced <b>before</b> money moves &mdash; a denial never reaches the resource server.</span>
+    </footer>
   </main>
 
-  <script src="app.js"></script>
+  <div class="toast-stack" id="toastStack" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="app.js?v=2"></script>
 </body>
 </html>
