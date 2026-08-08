@@ -18,7 +18,10 @@
         "weather"
       ],
       "per_request_limit_usd": 0.02,
-      "daily_cap_usd": 1.0
+      "daily_cap_usd": 1.0,
+      "frozen": false,
+      "max_requests_per_minute": 15,
+      "require_approval_above_usd": 0.01
     },
     "agent_enrichment": {
       "display_name": "Enrichment Bot",
@@ -26,7 +29,10 @@
         "enrich"
       ],
       "per_request_limit_usd": 0.1,
-      "daily_cap_usd": 2.0
+      "daily_cap_usd": 2.0,
+      "frozen": false,
+      "max_requests_per_minute": 15,
+      "require_approval_above_usd": 0.05
     },
     "agent_rogue": {
       "display_name": "Rogue Bot (tightly capped, on purpose)",
@@ -34,7 +40,10 @@
         "weather"
       ],
       "per_request_limit_usd": 0.01,
-      "daily_cap_usd": 0.02
+      "daily_cap_usd": 0.02,
+      "frozen": false,
+      "max_requests_per_minute": 10,
+      "require_approval_above_usd": null
     }
   }
 }

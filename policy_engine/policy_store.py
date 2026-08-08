@@ -20,7 +20,26 @@ _cache: dict = {"mtime": None, "data": None}
 # Fields a live PATCH is allowed to touch. display_name and which agents
 # exist at all are not editable through this API -- this is about
 # adjusting spend governance live, not reshaping the agent roster.
-MUTABLE_AGENT_FIELDS = {"per_request_limit_usd", "daily_cap_usd", "allowed_actions"}
+MUTABLE_AGENT_FIELDS = {
+    "per_request_limit_usd",
+    "daily_cap_usd",
+    "allowed_actions",
+    "frozen",
+    "max_requests_per_minute",
+    "require_approval_above_usd",
+}
+
+# Governance controls added after the original per-request/daily-cap pair.
+# Applied as defaults on load so a hand-written policy.json that predates
+# them (or just omits them) stays valid rather than KeyError-ing on every
+# request. `None` means "no limit" for both nullable fields -- absence has
+# to mean the permissive thing, or adding a field to this dict would
+# retroactively lock out every agent in an existing config.
+AGENT_DEFAULTS = {
+    "frozen": False,
+    "max_requests_per_minute": None,
+    "require_approval_above_usd": None,
+}
 
 
 def _load_locked() -> dict:
@@ -36,6 +55,9 @@ def _load_locked() -> dict:
             if _cache["data"] is not None:
                 return _cache["data"]
             raise
+        for cfg in data.get("agents", {}).values():
+            for field, default in AGENT_DEFAULTS.items():
+                cfg.setdefault(field, default)
         _cache["data"] = data
         _cache["mtime"] = mtime
     return _cache["data"]
@@ -62,3 +84,11 @@ def update_agent(agent_id: str, **fields) -> dict:
         _cache["data"] = data
         _cache["mtime"] = os.path.getmtime(POLICY_PATH)
         return data["agents"][agent_id]
+
+
+def set_frozen(agent_id: str, frozen: bool) -> dict:
+    """The kill switch. Separate from update_agent purely so the intent is
+    unambiguous at the call site and in the audit log -- "someone froze
+    agent_rogue" is a materially different event from "someone adjusted
+    agent_rogue's daily cap", even though both are a field write here."""
+    return update_agent(agent_id, frozen=frozen)

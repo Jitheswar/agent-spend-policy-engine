@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -67,29 +68,55 @@ def isolated_db(monkeypatch):
         os.remove(path)
 
 
+def utc_today() -> str:
+    """The UTC day try_reserve will actually stamp its rows with.
+
+    Never hardcode a date here. A previous version of these tests passed a
+    literal "2026-08-07" as both the reservation day and the day to query
+    back -- which quietly stopped exercising anything the moment the real
+    clock moved past it: try_reserve wrote rows stamped with the real today,
+    the cap query summed a day with no rows in it, and every reservation was
+    accepted because the cap always looked empty. Three tests, including the
+    concurrency regression test, passed for one day and then silently
+    inverted into testing nothing.
+    """
+    return datetime.now(timezone.utc).date().isoformat()
+
+
 def test_try_reserve_accepts_within_cap(isolated_db):
-    row = storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02, day="2026-08-07")
+    row = storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)
     assert row is not None
     assert row["decision"] == "pending"
-    assert storage.get_daily_spend("agent_a", "2026-08-07") == 0.01
+    assert storage.get_daily_spend("agent_a", utc_today()) == 0.01
 
 
 def test_try_reserve_rejects_over_cap(isolated_db):
-    storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02, day="2026-08-07")
-    row = storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02, day="2026-08-07")
+    storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02)
+    row = storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)
     assert row is None
     # The rejected attempt wrote nothing -- spend is still exactly the first call's.
-    assert storage.get_daily_spend("agent_a", "2026-08-07") == 0.02
+    assert storage.get_daily_spend("agent_a", utc_today()) == 0.02
+
+
+def test_try_reserve_allows_spending_exactly_up_to_the_cap(isolated_db):
+    """0.01 + 0.01 is 0.020000000000000004 in IEEE 754. Without a tolerance
+    in the cap comparison, an agent whose cap is exactly two calls wide gets
+    its second call denied roughly whenever the rounding lands high -- a
+    "you have $0.00 of $0.02 left" bug that only shows up for some amounts.
+    """
+    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02) is not None
+    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02) is not None
+    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02) is None
 
 
 def test_finalize_denied_frees_the_reservation(isolated_db):
     """A reservation whose payment subsequently fails must stop counting
     toward the cap -- otherwise a failed payment permanently burns budget."""
-    row = storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02, day="2026-08-07")
+    row = storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02)
     storage.finalize(row["id"], "denied", "payment request failed: connection refused")
-    assert storage.get_daily_spend("agent_a", "2026-08-07") == 0.0
+    assert storage.get_daily_spend("agent_a", utc_today()) == 0.0
     # Budget should be available again.
-    retry = storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02, day="2026-08-07")
+    retry = storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02)
     assert retry is not None
 
 
@@ -102,11 +129,10 @@ def test_concurrent_reservations_never_exceed_cap(isolated_db):
     """
     cap = 0.02
     amount = 0.01
-    day = "2026-08-07"
     n_requests = 12  # cap has room for exactly 2 of these
 
     def attempt(_):
-        return storage.try_reserve("agent_rogue", "weather", amount, cap, day)
+        return storage.try_reserve("agent_rogue", "weather", amount, cap)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_requests) as pool:
         results = list(pool.map(attempt, range(n_requests)))
@@ -114,7 +140,7 @@ def test_concurrent_reservations_never_exceed_cap(isolated_db):
     accepted = [r for r in results if r is not None]
     assert len(accepted) == 2, f"expected exactly 2 acceptances, got {len(accepted)}"
 
-    total_reserved = storage.get_daily_spend("agent_rogue", day)
+    total_reserved = storage.get_daily_spend("agent_rogue", utc_today())
     assert total_reserved == pytest.approx(0.02)
     assert total_reserved <= cap + 1e-9
 
