@@ -11,12 +11,18 @@ import base64
 import json
 import os
 
+import sys
+
 import algosdk
 from algosdk.v2client import algod
 from algosdk.transaction import PaymentTxn
 
-ACCOUNTS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "accounts.json")
-ALGOD_URL = "https://testnet-api.algonode.cloud"
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from common import config  # noqa: E402
+
+ACCOUNTS_PATH = config.ACCOUNTS_PATH
+ALGOD_URL = config.ALGOD_URL
 
 
 def main():

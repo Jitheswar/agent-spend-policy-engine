@@ -24,12 +24,22 @@ source .venv/bin/activate
 echo "==> Installing dependencies..."
 pip install -q -r requirements.txt
 
+# What this process is actually pointed at, before anything spends. The
+# expensive mistake isn't a setting you can't find -- it's one you never
+# thought to check because everything looked like it was working. Also fails
+# fast and loudly on a bad NETWORK or an unconfirmed mainnet.
+echo "==> Configuration"
+python3 -m common.config | sed 's/^/    /'
+echo ""
+
 if [ ! -f data/accounts.json ]; then
-  echo "==> Generating Algorand testnet accounts..."
+  echo "==> Generating Algorand accounts..."
   python3 scripts/setup_accounts.py generate
   echo ""
-  echo "!!! New accounts need testnet funding before payments will work."
-  echo "!!! See README.md (Algorand dispenser for ALGO, faucet.circle.com for USDC)."
+  echo "!!! New accounts hold nothing until they're funded, and payments fail"
+  echo "!!! until they are. Funding needs a captcha, so it's the one step that"
+  echo "!!! can't be automated -- the addresses and the dispenser link are"
+  echo "!!! printed above. See README.md for the walkthrough."
   echo ""
 fi
 

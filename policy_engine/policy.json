@@ -3,12 +3,26 @@
     "weather": {
       "resource_path": "/weather",
       "price_usd": 0.01,
-      "description": "Paid weather report API"
+      "description": "Live current conditions (Open-Meteo)",
+      "params": {
+        "city": {
+          "required": true,
+          "max_length": 64,
+          "default": "San Francisco"
+        }
+      }
     },
     "enrich": {
       "resource_path": "/enrich",
       "price_usd": 0.05,
-      "description": "Paid data enrichment API"
+      "description": "Public company filer profile (SEC EDGAR)",
+      "params": {
+        "company": {
+          "required": true,
+          "max_length": 64,
+          "default": "Apple Inc."
+        }
+      }
     }
   },
   "agents": {

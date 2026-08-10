@@ -35,25 +35,26 @@ import requests
 from algosdk.transaction import PaymentTxn, wait_for_confirmation
 from algosdk.v2client import algod
 
+from common import config
 from common.avm_client import load_accounts
 from policy_engine import storage
 
-ALGOD_URL = os.getenv("ALGOD_URL", "https://testnet-api.algonode.cloud")
-INDEXER_URL = os.getenv("INDEXER_URL", "https://testnet-idx.algonode.cloud")
-EXPLORER_TX_URL = "https://lora.algokit.io/testnet/transaction/{}"
+ALGOD_URL = config.ALGOD_URL
+INDEXER_URL = config.INDEXER_URL
+EXPLORER_TX_URL = config.EXPLORER_TX_URL
 
 NOTE_PREFIX = "ASPE1"
 
 # The account that pays the anchoring fee. Reusing `server` (the resource
 # server's payee) rather than adding a fifth funded account: it's already
 # funded with ALGO, and anchoring is an operator action, not an agent one.
-ANCHOR_ACCOUNT = "server"
+ANCHOR_ACCOUNT = config.ANCHOR_ACCOUNT
 
 # Anchor automatically once this many events have piled up since the last
 # one. Low enough that a demo produces several real anchors in a couple of
 # minutes, high enough that a burst of traffic doesn't fire a transaction
 # per request.
-AUTO_ANCHOR_THRESHOLD = int(os.getenv("AUTO_ANCHOR_THRESHOLD", "8"))
+AUTO_ANCHOR_THRESHOLD = config.AUTO_ANCHOR_THRESHOLD
 
 # Only one anchor may be in flight at a time -- two concurrent anchors would
 # race to read the same head and burn a second fee for no extra commitment.
@@ -73,7 +74,7 @@ def anchoring_disabled() -> bool:
     from a unit-test run -- slow, and it spends real (testnet) ALGO on fees
     for no benefit.
     """
-    return os.getenv("ASPE_DISABLE_ANCHOR") == "1"
+    return config.anchoring_disabled()
 
 
 def _algod() -> algod.AlgodClient:

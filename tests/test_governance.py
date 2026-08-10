@@ -24,10 +24,13 @@ from policy_engine import storage  # noqa: E402
 _ACCOUNTS = load_accounts()
 
 
-def signed_body(agent_id: str, action: str, amount_usd: float) -> dict:
+def signed_body(agent_id: str, action: str, amount_usd: float, params: dict | None = None) -> dict:
     sk = agent_secret_key_b64(agent_id, _ACCOUNTS)
-    fields = sign_request(sk, agent_id, action, amount_usd)
-    return {"agent_id": agent_id, "action": action, "amount_usd": amount_usd, **fields}
+    fields = sign_request(sk, agent_id, action, amount_usd, params)
+    body = {"agent_id": agent_id, "action": action, "amount_usd": amount_usd, **fields}
+    if params is not None:
+        body["params"] = params
+    return body
 
 
 @pytest.fixture
@@ -263,7 +266,7 @@ def test_approving_a_hold_runs_the_payment(client, monkeypatch):
 
     executed = []
 
-    def fake_execute(agent_id, action, action_cfg, reservation_id):
+    def fake_execute(agent_id, action, action_cfg, reservation_id, params=None):
         executed.append((agent_id, action, reservation_id))
         return {"decision": "approved", "reason": "stubbed", "log": storage.get_request(reservation_id)}
 
@@ -272,6 +275,46 @@ def test_approving_a_hold_runs_the_payment(client, monkeypatch):
     resp = client.post(f"/admin/holds/{held['request_id']}/approve")
     assert resp.json()["decision"] == "approved"
     assert executed == [("agent_weather", "weather", held["request_id"])]
+
+
+def test_a_hold_pays_for_the_call_the_reviewer_actually_saw(client, monkeypatch):
+    """A hold parks for as long as the reviewer takes, so the arguments have
+    to survive the wait. Releasing it must pay for the call as requested --
+    not re-resolve the params, which after a policy edit mid-queue would
+    spend the approval on a different call than the one that was reviewed.
+    """
+    from policy_engine import app as app_module
+
+    patch_agent(monkeypatch, "agent_weather", require_approval_above_usd=0.005)
+    held = client.post(
+        "/spend", json=signed_body("agent_weather", "weather", 0.01, {"city": "Reykjavik"})
+    ).json()
+    assert held["decision"] == "awaiting_approval"
+
+    # The operator changes the action's default while the hold sits queued.
+    real = app_module.policy_store.get_policy()
+    patched = {
+        **real,
+        "actions": {
+            **real["actions"],
+            "weather": {
+                **real["actions"]["weather"],
+                "params": {"city": {"required": True, "max_length": 64, "default": "Lagos"}},
+            },
+        },
+    }
+    monkeypatch.setattr(app_module.policy_store, "get_policy", lambda: patched)
+
+    paid_with = {}
+
+    def fake_execute(agent_id, action, action_cfg, reservation_id, params=None):
+        paid_with.update(params or {})
+        return {"decision": "approved", "reason": "stubbed", "log": storage.get_request(reservation_id)}
+
+    monkeypatch.setattr(app_module, "_execute_payment", fake_execute)
+    client.post(f"/admin/holds/{held['request_id']}/approve")
+
+    assert paid_with == {"city": "Reykjavik"}
 
 
 def test_freezing_an_agent_blocks_its_already_queued_holds(client, monkeypatch):
@@ -300,7 +343,7 @@ def test_a_hold_cannot_be_approved_twice(client, monkeypatch):
     monkeypatch.setattr(
         app_module,
         "_execute_payment",
-        lambda agent_id, action, cfg, rid: {
+        lambda agent_id, action, cfg, rid, params=None: {
             "decision": "approved",
             "reason": "stubbed",
             "log": storage.finalize(rid, "approved", "stubbed"),

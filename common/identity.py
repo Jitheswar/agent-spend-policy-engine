@@ -30,6 +30,7 @@ anyone without access to this repo's keys.
 """
 
 import base64
+import json
 import os
 import threading
 import time
@@ -45,25 +46,50 @@ _seen_lock = threading.Lock()
 _seen_nonces: dict[tuple[str, str], float] = {}
 
 
-def canonical_message(agent_id: str, action: str, amount_usd: float, timestamp: float, nonce: str) -> bytes:
-    # Fixed field order and separator -- both signer and verifier must
-    # build byte-identical messages or every signature fails.
-    return f"{agent_id}|{action}|{amount_usd}|{timestamp}|{nonce}".encode()
+def canonical_message(
+    agent_id: str, action: str, amount_usd: float, timestamp: float, nonce: str,
+    params: dict | None = None,
+) -> bytes:
+    """The exact bytes signed and verified. Fixed field order and separator
+    -- both sides must build byte-identical messages or every signature
+    fails.
+
+    `params` (the arguments the call is for: which city, which company) is
+    covered by the signature, because without it a valid signature for
+    "enrich, $0.05" would authorize enriching *any* company -- an attacker
+    who can modify a request in flight could redirect the call while leaving
+    the agent, action and amount untouched, and every check downstream would
+    still pass. Sorted keys and compact separators make the encoding
+    canonical, so two callers with the same params always produce the same
+    bytes regardless of dict ordering.
+
+    It's appended only when non-empty, so a paramless call signs exactly the
+    bytes it did before this field existed. That keeps every signature
+    already in flight, and every stored test vector, valid.
+    """
+    message = f"{agent_id}|{action}|{amount_usd}|{timestamp}|{nonce}"
+    if params:
+        message += "|" + json.dumps(params, sort_keys=True, separators=(",", ":"))
+    return message.encode()
 
 
-def sign_request(secret_key_b64: str, agent_id: str, action: str, amount_usd: float) -> dict:
+def sign_request(
+    secret_key_b64: str, agent_id: str, action: str, amount_usd: float,
+    params: dict | None = None,
+) -> dict:
     """Returns the fields a caller attaches to a /spend request: timestamp,
     nonce, and signature. secret_key_b64 is the same base64 sk format
     already used for payment signing (see common/avm_client.py)."""
     timestamp = time.time()
     nonce = base64.urlsafe_b64encode(os.urandom(9)).decode()
-    message = canonical_message(agent_id, action, amount_usd, timestamp, nonce)
+    message = canonical_message(agent_id, action, amount_usd, timestamp, nonce, params)
     signature = algosdk.util.sign_bytes(message, secret_key_b64)
     return {"timestamp": timestamp, "nonce": nonce, "signature": signature}
 
 
 def verify_request(
-    address: str, agent_id: str, action: str, amount_usd: float, timestamp: float, nonce: str, signature: str
+    address: str, agent_id: str, action: str, amount_usd: float, timestamp: float, nonce: str,
+    signature: str, params: dict | None = None,
 ) -> tuple[bool, str]:
     """Returns (ok, reason). Checks signature validity, freshness, and
     replay -- all three matter: a valid-but-old signature or a valid
@@ -72,7 +98,7 @@ def verify_request(
     if abs(now - timestamp) > REQUEST_TTL_SECONDS:
         return False, "request timestamp outside allowed window (stale or clock-skewed)"
 
-    message = canonical_message(agent_id, action, amount_usd, timestamp, nonce)
+    message = canonical_message(agent_id, action, amount_usd, timestamp, nonce, params)
     try:
         valid = algosdk.util.verify_bytes(message, signature, address)
     except Exception:

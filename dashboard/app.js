@@ -123,6 +123,21 @@ function escapeHtml(value) {
   return div.innerHTML;
 }
 
+// The request row carries params as a canonical JSON string (see the params
+// column in policy_engine/storage.py). Renders "Tokyo" rather than
+// {"city":"Tokyo"} -- the key is already implied by the action next to it,
+// and the feed is narrow. Returns "" for anything unparseable rather than
+// throwing: one malformed row must not take out the whole feed render.
+function paramSummary(raw) {
+  if (!raw) return "";
+  try {
+    const values = Object.values(JSON.parse(raw));
+    return values.length ? values.join(" · ") : "";
+  } catch {
+    return "";
+  }
+}
+
 async function fetchJSON(path, options) {
   const res = await fetch(`${POLICY_ENGINE_URL}${path}`, options);
   if (!res.ok) throw new Error(`${path} -> ${res.status}`);
@@ -717,10 +732,18 @@ function renderFeed(requests, newSince) {
       ? `<a class="tx-link" href="${escapeHtml(r.explorer_url)}" target="_blank" rel="noopener">${escapeHtml(r.tx_id.slice(0, 8))}&hellip;${ICON_LINK}</a>`
       : `<span class="tx-empty">&mdash;</span>`;
 
+    // What the call was actually for -- which city, which company. Now that
+    // the paid APIs hit real upstreams, "$0.05 on enrich" and "$0.05 to
+    // enrich Apple Inc." are very different rows to an operator reading the
+    // feed back. Same escaping rule as everything else here: params come
+    // straight off a /spend body.
+    const args = paramSummary(r.params);
+    const argCell = args ? `<span class="cell-args">${escapeHtml(args)}</span>` : "";
+
     tr.innerHTML = `
       <td class="cell-time">${escapeHtml(time)}</td>
       <td class="cell-agent"><span class="dot"></span>${escapeHtml(r.agent_id)}</td>
-      <td class="cell-action"><code>${escapeHtml(r.action)}</code></td>
+      <td class="cell-action"><code>${escapeHtml(r.action)}</code>${argCell}</td>
       <td class="cell-amount">${escapeHtml(fmtUsd(r.amount_usd))}</td>
       <td>${decisionPill}</td>
       <td class="reason-cell">${escapeHtml(r.reason)}</td>

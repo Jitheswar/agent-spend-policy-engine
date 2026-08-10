@@ -39,7 +39,9 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "policy_engine.db")
+from common import config
+
+DB_PATH = config.DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
@@ -51,7 +53,14 @@ CREATE TABLE IF NOT EXISTS requests (
     decision TEXT NOT NULL,
     reason TEXT NOT NULL,
     tx_id TEXT,
-    explorer_url TEXT
+    explorer_url TEXT,
+    -- The resolved call arguments, as canonical JSON ({} when the action
+    -- takes none). Stored rather than derived for two reasons: a spend
+    -- parked for human approval has to still know which company it was
+    -- going to enrich when someone releases it minutes later, and "$0.05
+    -- on enrich" is a much weaker audit record than "$0.05 to enrich
+    -- Apple Inc." for the operator reading it back.
+    params TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -113,9 +122,22 @@ def _connect():
         conn.close()
 
 
+# Columns added after the first release. CREATE TABLE IF NOT EXISTS does
+# nothing to a table that already exists, so a database created before a
+# column was introduced needs it added explicitly -- otherwise the schema
+# only looks right on a machine that started from an empty data/ directory.
+MIGRATIONS = [
+    ("requests", "params", "ALTER TABLE requests ADD COLUMN params TEXT NOT NULL DEFAULT '{}'"),
+]
+
+
 def init_db() -> None:
     with _connect() as conn:
         conn.executescript(SCHEMA)
+        for table, column, ddl in MIGRATIONS:
+            existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                conn.execute(ddl)
 
 
 def _now() -> str:
@@ -371,6 +393,7 @@ def log_request(
     reason: str,
     tx_id: str | None = None,
     explorer_url: str | None = None,
+    params: dict | None = None,
 ) -> dict:
     """Logs a decision that never touched the daily-cap budget (a straight
     deny -- unknown agent/action, per-request limit, frozen agent, etc).
@@ -378,11 +401,13 @@ def log_request(
     finalize() instead.
     """
     ts = _now()
+    params_json = canonical_payload(params or {})
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO requests (timestamp, agent_id, action, amount_usd, decision, reason, tx_id, explorer_url) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (ts, agent_id, action, amount_usd, decision, reason, tx_id, explorer_url),
+            "INSERT INTO requests "
+            "(timestamp, agent_id, action, amount_usd, decision, reason, tx_id, explorer_url, params) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (ts, agent_id, action, amount_usd, decision, reason, tx_id, explorer_url, params_json),
         )
         row = dict(conn.execute("SELECT * FROM requests WHERE id = ?", (cur.lastrowid,)).fetchone())
         _append_event_locked(
@@ -393,6 +418,7 @@ def log_request(
                 "agent_id": agent_id,
                 "action": action,
                 "amount_usd": amount_usd,
+                "params": params or {},
                 "decision": decision,
                 "reason": reason,
                 "tx_id": tx_id,
@@ -407,6 +433,7 @@ def try_reserve(
     amount_usd: float,
     daily_cap_usd: float,
     decision: str = "pending",
+    params: dict | None = None,
 ) -> dict | None:
     """Atomically checks the daily cap and reserves amount_usd against it.
 
@@ -460,9 +487,9 @@ def try_reserve(
             else "reserved, awaiting human approval"
         )
         cur = conn.execute(
-            "INSERT INTO requests (timestamp, agent_id, action, amount_usd, decision, reason) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (ts, agent_id, action, amount_usd, decision, reason),
+            "INSERT INTO requests (timestamp, agent_id, action, amount_usd, decision, reason, params) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ts, agent_id, action, amount_usd, decision, reason, canonical_payload(params or {})),
         )
         row_id = cur.lastrowid
         _append_event_locked(
@@ -473,6 +500,7 @@ def try_reserve(
                 "agent_id": agent_id,
                 "action": action,
                 "amount_usd": amount_usd,
+                "params": params or {},
                 "state": decision,
             },
         )
@@ -509,6 +537,11 @@ def finalize(
                 "agent_id": row["agent_id"],
                 "action": row["action"],
                 "amount_usd": row["amount_usd"],
+                # Read back off the row rather than taken as an argument:
+                # finalize is called from the approval-release path minutes
+                # after the reservation was written, and the params that
+                # matter are the ones the request was actually made with.
+                "params": json.loads(row["params"] or "{}"),
                 "decision": decision,
                 "reason": reason,
                 "tx_id": tx_id,

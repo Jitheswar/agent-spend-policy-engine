@@ -12,7 +12,9 @@ import json
 import os
 import threading
 
-POLICY_PATH = os.path.join(os.path.dirname(__file__), "policy.json")
+from common import config
+
+POLICY_PATH = config.POLICY_PATH
 
 _lock = threading.Lock()
 _cache: dict = {"mtime": None, "data": None}

@@ -1215,6 +1215,22 @@ main {
   color: var(--text-2);
 }
 
+/* What the paid call was actually for -- the city or company. Secondary to
+   the action name it sits beside, and truncated rather than allowed to widen
+   the column, since a company name can run long. */
+.cell-args {
+  display: inline-block;
+  max-width: 14ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+  margin-left: 8px;
+  font-size: 0.72rem;
+  color: var(--text-3, var(--text-2));
+  opacity: 0.75;
+}
+
 .decision-pill {
   display: inline-flex;
   align-items: center;

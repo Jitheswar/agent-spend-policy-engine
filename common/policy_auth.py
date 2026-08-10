@@ -26,7 +26,9 @@ import os
 import secrets
 import time
 
-SECRET_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "policy_auth_secret.txt")
+from common import config
+
+SECRET_PATH = config.POLICY_AUTH_SECRET_PATH
 # Must comfortably exceed the policy engine's outbound request timeout
 # (currently 60s, see policy_engine/app.py) -- this token is minted once
 # and used for both the initial 402-triggering request and the paid retry,

@@ -32,14 +32,16 @@ import algosdk
 from algosdk.transaction import AssetTransferTxn, PaymentTxn, wait_for_confirmation
 from algosdk.v2client import algod
 
-ACCOUNTS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "accounts.json")
-ALGOD_URL = os.getenv("ALGOD_URL", "https://testnet-api.algonode.cloud")
-USDC_ASA_ID = int(os.getenv("USDC_ASA_ID", "10458941"))
+from common import config
+
+ACCOUNTS_PATH = config.ACCOUNTS_PATH
+ALGOD_URL = config.ALGOD_URL
+USDC_ASA_ID = config.USDC_ASA_ID
 
 # Enough ALGO to cover the 0.1 minimum balance, the extra 0.1 minimum an ASA
 # opt-in imposes, and a long demo's worth of fees at 0.001 each.
-FUND_ALGO = float(os.getenv("PROVISION_ALGO", "0.5"))
-FUND_USDC = float(os.getenv("PROVISION_USDC", "0.5"))
+FUND_ALGO = config.PROVISION_ALGO
+FUND_USDC = config.PROVISION_USDC
 
 # agent_id -> {"state": ..., "message": ..., "tx_ids": [...]}
 # State machine: funding -> ready | failed. Read by GET /agents so the

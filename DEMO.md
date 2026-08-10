@@ -19,12 +19,17 @@ time for it.
 Point at the agent fleet. Each card is one agent with its own Algorand
 address, its own budget, and its own rules.
 
+The APIs behind the paywall are real, and it's worth saying so early: the
+weather comes from Open-Meteo, the company data from SEC EDGAR. Nothing in
+the path is stubbed, which is why the feed shows a real city and a real
+filer next to each spend.
+
 ---
 
 ## 0b · Add a fourth agent, live (60 seconds)
 
-Click **+ Onboard an agent**. The form is pre-filled for DeepSeek; change
-nothing and click **Onboard & fund**.
+Click **+ Onboard an agent**. The form is pre-filled; change nothing and
+click **Onboard & fund**.
 
 The card appears immediately, marked *Provisioning*, with its Fire buttons
 disabled.
@@ -44,9 +49,6 @@ enable. Now click **Fire: weather** on the new card.
 > added this agent and what limits they gave it is exactly the kind of thing
 > an operator shouldn't be able to quietly rewrite later."
 
-If you're pairing this with §1b, onboard it with **enrich** unchecked (the
-default) — that's what makes the LLM's enrichment call get denied.
-
 To re-run the demo: **Deregister agent** on that card. The account and its
 history are kept, so onboarding it again is instant the second time — which
 is worth knowing before you rehearse and wonder why it didn't pause.
@@ -60,40 +62,12 @@ Click **Fire: weather** on Weather Bot.
 What to say while it settles (~2s):
 
 > "That request was signed with the agent's own Algorand key, checked
-> against seven policy rules, and only then paid. The transaction ID in the
+> against nine policy rules, and only then paid. The transaction ID in the
 > feed is a real Algorand testnet transaction — click it."
 
-Click the tx link. A real block explorer, a real USDC transfer.
-
----
-
-## 1b · Optional: a real LLM agent, live (60 seconds)
-
-Only if `DEEPSEEK_API_KEY` is set — it's a live API call, so skip it if the
-room's network is unreliable. It is the strongest beat in the demo when it
-works, and the natural substitute for §2 if you're tight on time.
-
-```bash
-python3 agents/llm_agent.py --agent agent_deepseek "Get me an enrichment profile on Acme Corp, and the weather."
-```
-
-(Drop `--agent agent_deepseek` if you skipped §0b — it runs as
-`agent_weather` by default, which is capped the same way.)
-
-> "That's not a script firing requests I chose. That's a real model with
-> two tools, deciding for itself what to call. It has no key, it's never
-> heard of x402, and it can't reach the paid API — every tool call goes
-> through the policy engine first."
-
-Weather gets approved and paid on-chain. Enrichment comes back
-`not approved for action 'enrich'` — and the denial goes back into the
-conversation as a tool result:
-
-> "Watch what it does with that. It doesn't crash and it doesn't retry —
-> it reads the denial, drops that part of the plan, and tells the user what
-> it couldn't get. The governance layer is inside the agent's loop."
-
-The new rows appear in the dashboard feed as it runs.
+Click the tx link. A real block explorer, a real USDC transfer. The row in
+the feed names the city it actually fetched, and the conditions that came
+back are today's.
 
 ---
 
@@ -106,6 +80,42 @@ on Rogue Bot three times.
 > the third is denied. And note *where* it's denied — the resource server
 > never sees the third request at all. There's no payment to reverse,
 > because none was ever attempted."
+
+---
+
+## 2b · When the vendor fails, the agent doesn't pay (40 seconds)
+
+Optional, and the best answer to "but what if the API is down?". In the
+terminal:
+
+```bash
+python3 agents/simulate.py once
+```
+
+The last two denials in that run are the ones to point at: a request
+carrying a parameter no policy declares, and an unregistered agent.
+
+Then ask for somewhere that doesn't exist:
+
+```bash
+curl -s -X POST http://127.0.0.1:4022/spend -H 'Content-Type: application/json' \
+  -d "$(python3 -c "
+import json,sys; sys.path.insert(0,'.')
+from common.avm_client import agent_secret_key_b64, load_accounts
+from common.identity import sign_request
+a=load_accounts(); p={'city':'Xyzzyville'}
+b={'agent_id':'agent_weather','action':'weather','amount_usd':0.01,'params':p}
+b.update(sign_request(agent_secret_key_b64('agent_weather',a),'agent_weather','weather',0.01,p))
+print(json.dumps(b))")"
+```
+
+> "Policy said yes — the agent was allowed, in budget, under its rate limit.
+> It got as far as the paid API, and the upstream had no such place. Watch
+> what it costs: nothing. Payment settles only after the API returns
+> something under a 400, so a call that didn't deliver never takes the
+> agent's money. And the denial says `upstream_not_found`, not 'settlement
+> failed' — because the payment rail was fine, the vendor just didn't have
+> it."
 
 ---
 

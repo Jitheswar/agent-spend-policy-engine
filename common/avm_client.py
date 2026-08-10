@@ -15,7 +15,9 @@ from x402 import x402ClientSync
 from x402.http.clients.requests import x402_requests
 from x402.mechanisms.avm.exact.register import register_exact_avm_client
 
-ACCOUNTS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "accounts.json")
+from common import config
+
+ACCOUNTS_PATH = config.ACCOUNTS_PATH
 
 
 class AlgorandSigner:

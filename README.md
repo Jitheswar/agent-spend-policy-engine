@@ -8,9 +8,18 @@ written to an **append-only hash-chained audit ledger whose head is
 notarized on Algorand** — so the record of what your agents did can be
 proven unedited by someone who doesn't trust you.
 
+The APIs behind the paywall are real. `/weather` geocodes a city and returns
+live conditions from **Open-Meteo**; `/enrich` resolves a ticker or company
+name to a CIK and returns that filer's public profile from **SEC EDGAR**.
+Nothing in the request path is stubbed.
+
 ```bash
 ./start.sh          # then open http://127.0.0.1:4023/index.html
 ```
+
+New here? **[GETTING_STARTED.md](GETTING_STARTED.md)** goes from `git clone`
+to a paid API call in about fifteen minutes, including the one step that
+needs a human and what to do when something doesn't work.
 
 ## Why this needs a blockchain
 
@@ -121,6 +130,13 @@ x402 pattern (stable pricing per call).
   anything without a valid token from the policy engine) and the x402
   payment middleware. It knows nothing about spend policy; it just refuses
   to serve anyone the engine hasn't cleared.
+- **`resource_server/upstreams.py`** — the actual vendors: Open-Meteo for
+  weather, SEC EDGAR for company data. Both free and keyless, which is the
+  point worth being clear about — the money here isn't covering an upstream
+  bill, it's demonstrating metered settlement between an agent and an API it
+  has no account with. Responses are cached per-source; a cache hit is still
+  a sale, which is ordinary for a metered API and keeps a demo loop from
+  hammering someone's free endpoint.
 - **`common/identity.py`** — signs/verifies `/spend` requests with the
   agent's own Algorand key (`algosdk.util.sign_bytes`/`verify_bytes`),
   domain-separated from transaction signing. Replay-guarded (nonce + 60s
@@ -129,10 +145,11 @@ x402 pattern (stable pricing per call).
   mints per approved spend and the resource server verifies.
 - **`agents/simulate.py`** — fires curated, repeatable sequences of
   *signed* requests, using key material it has legitimate local access to.
-- **`agents/llm_agent.py`** — a real LLM (DeepSeek) doing tool calls, where
-  every tool is a governed spend. See below.
 - **`common/provisioning.py`** — onboards a new agent at runtime: keypair,
   ALGO for fees, USDC opt-in, working capital, all on-chain.
+- **`common/config.py`** — every knob in one place, resolved from one
+  `NETWORK` setting and a `.env`. Nothing else in the codebase reads an
+  environment variable or holds a network constant; a test enforces that.
 - **`dashboard/`** — static HTML/JS mission control.
 
 ## The controls
@@ -147,6 +164,7 @@ is evaluated, and the kill switch is checked before every budget rule.
 | **Cryptographic identity** | `identity_failed` | Caller controls that agent's Algorand key. Replay-guarded, 60s TTL |
 | **Kill switch** | `frozen` | Stop an agent *now*, regardless of remaining budget |
 | Allowed action | `action_not_allowed` | This agent may call this API at all |
+| **Call arguments** | `invalid_params` | Bound *what* it may ask for, not just what it may spend |
 | Per-request limit | `over_per_request_limit` | Bound any single call |
 | **Velocity** | `over_velocity_limit` | Bound the *rate*. A daily cap doesn't stop a retry loop burning it in seconds |
 | Daily cap | `over_daily_cap` | Bound the day. Atomically reserved, so concurrent calls can't both slip under |
@@ -155,10 +173,61 @@ is evaluated, and the kill switch is checked before every budget rule.
 The last one parks the request holding its budget, so a queued approval
 can't be double-spent against while it waits. Freezing an agent while a
 hold is queued blocks the release too — otherwise the kill switch would
-have a queue-shaped hole in it.
+have a queue-shaped hole in it. Releasing a hold pays for the call as
+originally requested, arguments included, so a policy edit landing while it
+sat in the queue can't spend a reviewer's approval on a different call than
+the one they saw.
 
 Per-agent config lives in `policy_engine/policy.json` and is editable live
 (`PATCH /admin/agents/{id}`, or just edit the file — it hot-reloads).
+
+### Call arguments are policy too
+
+Once the paid APIs take arguments, "how much may this agent spend" stops
+being the whole question — an agent with a perfectly ordinary budget can
+still call a sanctioned action with arguments nobody sanctioned. So each
+action declares what it accepts:
+
+```json
+"weather": {
+  "resource_path": "/weather",
+  "price_usd": 0.01,
+  "params": { "city": { "required": true, "max_length": 64, "default": "San Francisco" } }
+}
+```
+
+An undeclared key is a denial, not something quietly forwarded upstream. A
+`default` is what lets the dashboard's one-click Fire buttons work without
+an operator typing a city each time; defaults come from policy, never from
+the caller.
+
+Arguments are **covered by the request signature**. Without that, a valid
+signature for "enrich, $0.05" would authorize enriching *any* company, and
+anyone able to modify a request in flight could redirect the call while
+leaving agent, action and amount untouched. They're appended to the signed
+message only when non-empty, so paramless calls sign exactly the bytes they
+did before the field existed.
+
+They're also in the ledger, including on denials raised before validation
+even runs: *agent_rogue tried to enrich Tesla and was refused* is the
+sentence an operator needs, not *agent_rogue was refused*.
+
+### A failed upstream never costs the agent
+
+The x402 middleware settles payment **after** calling the route, and only if
+it returned a status under 400. So every handler turns an upstream failure
+into a real non-2xx rather than a 200 carrying an error body — vendor down,
+rate-limited, city that doesn't exist, all of it — and no payment is taken
+for a call that didn't deliver. Verified on testnet: requesting weather for
+a nonexistent city returns `upstream_not_found` and moves exactly 0.000000
+USDC. `tests/test_upstreams.py` asserts it against the real installed
+middleware rather than trusting the reading, since a dependency upgrade
+could quietly reverse it.
+
+That taxonomy is kept distinct from payment failure on purpose. A 402 means
+the payment leg broke — facilitator, chain, balance. A 5xx from the vendor
+behind the paywall has nothing to do with payments at all, and reporting
+both as "settlement failed" sends whoever is on call to the wrong system.
 
 ## Setup + run
 
@@ -166,11 +235,14 @@ Per-agent config lives in `policy_engine/policy.json` and is editable live
 ./start.sh
 ```
 
-One command: creates the venv, installs dependencies, generates the four
-Algorand testnet accounts (`data/accounts.json`, gitignored, testnet-only)
-if missing, checks/opts them into testnet USDC, then starts all three
+One command: creates the venv, installs dependencies, prints the resolved
+configuration, generates the Algorand accounts (`data/accounts.json`,
+gitignored) if missing, checks/opts them into USDC, then starts all three
 services — resource server (`:4021`), policy engine (`:4022`), dashboard
 (`:4023`). Safe to re-run; it only creates what's missing.
+
+No `.env` is needed — every setting has a working default and it runs
+against testnet as shipped.
 
 Once every account is confirmed funded and opted in, a `data/.setup_verified`
 marker is written and later runs skip the on-chain balance/opt-in checks —
@@ -179,23 +251,82 @@ multiple seconds each. Run `./start.sh --recheck` (or delete
 `data/.setup_verified`) to force them again — e.g. after re-funding an
 account.
 
+### Configuration
+
+One file, one setting that matters:
+
+```bash
+cp .env.example .env      # optional; defaults work without it
+python3 -m common.config  # what this process is actually pointed at
+```
+
+```
+network      : testnet  (test funds)
+algod        : https://testnet-api.algonode.cloud
+indexer      : https://testnet-idx.algonode.cloud
+paying asset : USDC (ASA 10458941)
+facilitator  : https://facilitator.goplausible.xyz
+```
+
+`NETWORK` (`testnet` | `mainnet`) derives the algod node, the indexer, the
+USDC asset id, the CAIP-2 chain id and the explorer links **together**, from
+the same network profile the x402 library uses to build and settle payments.
+That's the point of doing it in one place: the failure mode where anchoring
+writes to one chain while payments settle on another is unrepresentable
+rather than merely unlikely. Individual endpoints can still be overridden
+one at a time (a private algod, a paid indexer) without disturbing the rest.
+
+Real environment variables beat `.env`, so `NETWORK=mainnet ./start.sh`
+works without editing anything. `start.sh` prints the block above before
+anything spends — the expensive mistake here isn't a setting you can't find,
+it's one you never thought to check.
+
+`NETWORK=mainnet` refuses to start unless `ALLOW_MAINNET=true` is set
+alongside it. Real funds plus unauthenticated `/admin` routes (limitation #8
+below) shouldn't be reachable by a typo. Localnet isn't offered: settlement
+goes through a public x402 facilitator, which can't reach a chain on your
+laptop.
+
+Every knob is listed with its default in [`.env.example`](.env.example);
+a test asserts nothing the config module reads is missing from it.
+
 ### Funding the accounts (one-time, needs a human)
 
 The first run generates accounts with zero balance; payments fail until
 funded:
 
-1. **ALGO** (for fees/min-balance, and for anchoring): the official
-   Algorand TestNet Dispenser at https://bank.testnet.algorand.network/
-   (Google login + captcha, so a human has to do this).
-2. **Testnet USDC** (what payments actually happen in): **faucet.circle.com**
-   → Algorand testnet → request for each `agent_*` address. The `server`
-   address needs ALGO (it pays anchoring fees) but never needs USDC.
+1. **ALGO** (fees, minimum balance, anchoring): the Algorand TestNet
+   Dispenser, https://lora.algokit.io/testnet/fund (sign-in + captcha, so a
+   human has to do this).
+2. **Testnet USDC** (what payments actually move): https://faucet.circle.com
+   → Algorand testnet → request for each address. 20 USDC per address per
+   2 hours, which is far more than this demo spends in cents.
+
+Every address needs both, `server` included — it pays anchoring fees in
+ALGO *and* funds newly onboarded agents out of its own USDC (see
+`common/provisioning.py`). Onboarding fails visibly if its balance is empty.
+
+**[GETTING_STARTED.md](GETTING_STARTED.md)** walks the whole thing end to
+end, including what to do when a step doesn't work.
 
 Re-run `./start.sh` after funding. Or check manually:
 
 ```bash
 python3 scripts/setup_accounts.py balances
 ```
+
+### One thing to set before real traffic
+
+Neither upstream needs an API key, but SEC's fair-access policy asks callers
+to identify themselves and throttles the ones that don't. In `.env`:
+
+```
+SEC_USER_AGENT=your-project/1.0 (you@example.com)
+```
+
+Open-Meteo needs nothing. Both are free, so no upstream bill accrues no
+matter how the demo is driven — the only real cost anywhere here is Algorand
+transaction fees.
 
 Fire scenarios from the CLI instead of the dashboard:
 
@@ -204,6 +335,14 @@ python3 agents/simulate.py once       # one pass through the curated scenarios
 python3 agents/simulate.py loop 4     # repeat every 4s
 python3 agents/simulate.py burst 25   # runaway agent -- trips the velocity limiter
 ```
+
+`once` uses varied real arguments (Reykjavik, Osaka, NVDA…) so each pass
+genuinely exercises the upstreams instead of being served from cache. It
+also includes a request carrying a parameter no policy declares, which is
+denied before any budget moves. `burst` deliberately sends no arguments at
+all: every call resolves to the action's default and hits the resource
+server's cache, because the thing under test there is the rate limiter and
+25 live lookups would be an unkind way to prove it.
 
 See **[DEMO.md](DEMO.md)** for a five-minute walkthrough script.
 
@@ -238,7 +377,7 @@ Same thing from the CLI:
 
 ```bash
 curl -X POST http://127.0.0.1:4022/admin/agents -H 'Content-Type: application/json' \
-  -d '{"agent_id":"agent_deepseek","display_name":"DeepSeek Agent",
+  -d '{"agent_id":"agent_research","display_name":"Research Agent",
        "allowed_actions":["weather"],"per_request_limit_usd":0.02,"daily_cap_usd":0.10}'
 ```
 
@@ -262,61 +401,15 @@ rewrite.
 python3 scripts/setup_accounts.py balances
 ```
 
-## A real LLM agent under the policy
-
-`agents/simulate.py` fires requests a human picked in advance. That proves
-the engine works; it doesn't prove an *autonomous* agent is actually
-constrained by it. `agents/llm_agent.py` closes that gap: a real DeepSeek
-model, given ordinary tools, deciding for itself what to call.
-
-```bash
-export DEEPSEEK_API_KEY=sk-...
-python3 agents/llm_agent.py "Get me an enrichment profile on Acme Corp, and the weather."
-```
-
-The model gets two tools — `get_weather`, `enrich_company` — and nothing
-else. It has no Algorand key, never sees the resource server, and doesn't
-know x402 exists. Each tool call is routed through a signed `POST /spend`,
-and the value returned to the model is whatever the policy engine decided:
-
-| Decision | What the model receives |
-|---|---|
-| approved | the real API response, paid for on-chain, with the tx id |
-| denied | the denial reason, verbatim |
-| awaiting_approval | nothing — the agent **blocks** until a human clicks approve or reject in the dashboard |
-
-Both tools are always offered, whatever identity you run as. That's
-deliberate: the model is never prevented from *trying*, so anything that
-stops it is the policy engine and not this script. Running the command
-above as the default `agent_weather` — which is approved for weather only —
-is the demo worth watching: the enrichment call comes back
-`not approved for action 'enrich'`, that denial lands in the conversation
-as a tool result, and the model rewrites its plan and reports what it
-couldn't get. The governance layer is inside the agent's loop, not wrapped
-around it.
-
-```bash
-python3 agents/llm_agent.py --agent agent_rogue "Check the weather a few times."
-```
-
-`agent_rogue` has a $0.02 daily cap, so the model spends twice, gets cut
-off mid-task, and has to say so. Every spend and denial above is in the
-same audit ledger, anchored on Algorand, and `scripts/verify_audit.py`
-covers them exactly like any other.
-
-DeepSeek is used because its API is OpenAI-compatible, so this is plain
-`requests` against the standard chat-completions shape and adds no
-dependency. Point `DEEPSEEK_BASE_URL`/`DEEPSEEK_MODEL` at any compatible
-endpoint to swap the model out.
-
 ## Tests
 
 ```bash
 pytest tests/ -v
 ```
 
-75 tests, no network required (anchoring is disabled process-wide in
-`tests/conftest.py`, so a unit-test run never submits a transaction).
+127 tests, no network required — the upstreams are mocked and anchoring is
+disabled process-wide in `tests/conftest.py`, so a unit-test run never
+submits a transaction or calls a vendor.
 
 - `test_policy_engine.py` — policy decisions, the daily-cap concurrency fix
   (12 simultaneous reservations against a cap with room for 2, asserts
@@ -336,6 +429,20 @@ pytest tests/ -v
 - `test_policy_auth.py` — resource-server token: wrong action, tampered
   signature, expired, malformed.
 - `test_policy_store.py` — hot-reload on file edit, live `PATCH` persists.
+- `test_config.py` — `.env` parsing and precedence, both network profiles
+  resolving consistently against the payment library's own config, the
+  mainnet guard (including in a fresh interpreter), and a sweep asserting no
+  module outside `common/config.py` carries its own copy of a network
+  constant — the explorer URL used to be hardcoded in two files.
+- `test_upstreams.py` — Open-Meteo and EDGAR parsing, the failure taxonomy
+  (timeout vs unreachable vs rate-limited vs not-found), name resolution
+  preferring the parent company over a longer namesake, and the one that
+  matters most: driving the real x402 middleware to prove a route returning
+  >= 400 is never settled, while a 200 still is.
+- `test_params.py` — schema enforcement, defaults, params covered by the
+  signature (swapping them in flight fails identity), the arguments
+  surviving an approval hold across a policy edit, and the SQLite migration
+  that adds the column to a database created before it existed.
 
 Doesn't cover the approval path end-to-end (that needs a live facilitator +
 funded testnet accounts — see `scripts/phase1_client.py` for that proof).
@@ -412,6 +519,32 @@ by the `server` account. At the default threshold that's roughly one
 transaction per 8 decisions. A production deployment would batch harder
 (anchor every N minutes rather than every N events) and probably commit a
 Merkle root over a batch rather than a running chain head.
+
+**7. The upstreams are free, so nothing here is arbitrage.** Deliberate, and
+worth saying plainly rather than letting "real paid API" imply more than it
+should. Open-Meteo and EDGAR cost nothing to call; the $0.01 and $0.05 are
+demonstrating metered settlement between an agent and an API it has no
+account with, not marking up a wholesale price. What that does buy is real
+failure modes — an upstream that times out, rate-limits, or has no record of
+what you asked for — and those are the cases the no-charge guarantee above
+is written against. Pointing either action at a genuinely paid vendor
+changes only `upstreams.py`.
+
+Two consequences to know about. A cache hit is still a sale, which is
+ordinary for a metered API but means a repeated call can settle without a
+fresh upstream fetch. And the upstream round trip happens *inside* the
+payment window, so vendor latency adds to a `/spend` that was already
+waiting on a facilitator — the upstream timeout is capped at 10s against the
+engine's 60s outbound budget specifically so a slow vendor can't starve the
+payment leg and surface as a payment failure.
+
+**8. The admin plane still has no authentication.** Not fixed, and the
+largest remaining hole. Every `/admin/*` route — freeze, unfreeze, onboard,
+approve a held spend, edit a cap — is reachable by anything that can open a
+socket to `:4022`. For a system whose whole product is "a person controls
+what the agents do," the kill switch having no lock on it is the gap to
+close next. `/admin/demo/tamper` and `/admin/sign` also ship enabled and
+should be behind an explicit flag.
 
 ## Verifying it's real
 

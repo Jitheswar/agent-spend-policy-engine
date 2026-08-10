@@ -12,11 +12,12 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from x402.http import x402HTTPClientSync
+from common import config
 from common.avm_client import build_paying_session
 
-RESOURCE_SERVER_URL = os.getenv("RESOURCE_SERVER_URL", "http://127.0.0.1:4021")
-ENDPOINT_PATH = os.getenv("ENDPOINT_PATH", "/weather")
-AGENT_NAME = os.getenv("AGENT_NAME", "agent_weather")
+RESOURCE_SERVER_URL = config.RESOURCE_SERVER_URL
+ENDPOINT_PATH = config.env("ENDPOINT_PATH", "/weather")
+AGENT_NAME = config.env("AGENT_NAME", "agent_weather")
 
 
 def main():
@@ -43,7 +44,7 @@ def main():
                 print(json.dumps(data, indent=2))
                 txid = data.get("transaction")
                 if txid:
-                    print(f"\nAlgorand testnet explorer: https://lora.algokit.io/testnet/transaction/{txid}")
+                    print(f"\nAlgorand explorer: {config.explorer_url(txid)}")
             except ValueError:
                 print("No payment response header found (was this route actually paid?)")
         else:

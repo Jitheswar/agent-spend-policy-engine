@@ -20,6 +20,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -27,12 +28,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from common import anchor, identity, policy_auth, provisioning
+from common import anchor, config, identity, policy_auth, provisioning
 from common.avm_client import agent_address, agent_secret_key_b64, build_paying_session, load_accounts
 from policy_engine import policy_store, storage
 
-RESOURCE_SERVER_URL = os.getenv("RESOURCE_SERVER_URL", "http://127.0.0.1:4021")
-EXPLORER_TX_URL = "https://lora.algokit.io/testnet/transaction/{}"
+RESOURCE_SERVER_URL = config.RESOURCE_SERVER_URL
 
 VELOCITY_WINDOW_SECONDS = 60
 
@@ -45,10 +45,7 @@ app.add_middleware(
     # local-only/testnet, not a hard security boundary, but there's no
     # reason to let an arbitrary third-party page POST /spend or
     # /admin/reset against a browser that happens to have this open.
-    allow_origins=[
-        "http://127.0.0.1:4023",
-        "http://localhost:4023",
-    ],
+    allow_origins=config.DASHBOARD_ORIGINS,
     # DELETE is here for deregistering an agent. It's easy to add an endpoint
     # and forget this list -- the browser then fails the preflight and the
     # button does nothing, while curl against the same route works fine,
@@ -90,12 +87,20 @@ class SpendRequest(BaseModel):
     # that's dictated by the protocol, not the client -- so this models
     # "authorize up to $X," not "pay exactly $X."
     amount_usd: float | None = Field(default=None, ge=0, le=1000)
+    # The arguments the call is actually for -- which city, which company.
+    # Validated against the action's declared param schema in policy.json
+    # (see _resolve_params) and forwarded to the resource server as the
+    # query string. Omitted keys fall back to the schema's default, which
+    # is what lets the dashboard's one-click Fire buttons work without
+    # asking an operator to type a city every time.
+    params: dict[str, str] | None = None
     # Cryptographic proof this request actually came from someone who
     # controls agent_id's Algorand private key (see common/identity.py).
     # Required on every call -- there is no unsigned path to /spend.
     # Signed over the RESOLVED amount (amount_usd if given, else the
-    # action's configured price), so the caller must know that value
-    # up front -- see POST /admin/sign for how the dashboard gets it.
+    # action's configured price) and over params as supplied, so the caller
+    # must know both up front -- see POST /admin/sign for how the dashboard
+    # gets them.
     timestamp: float
     nonce: str = Field(max_length=32)
     signature: str = Field(max_length=256)
@@ -105,6 +110,7 @@ class SignRequest(BaseModel):
     agent_id: str = Field(max_length=128)
     action: str = Field(max_length=128)
     amount_usd: float = Field(ge=0, le=1000)
+    params: dict[str, str] | None = None
 
 
 @app.post("/admin/sign")
@@ -125,7 +131,9 @@ def admin_sign(req: SignRequest):
     if req.agent_id not in accounts:
         raise HTTPException(404, f"unknown agent '{req.agent_id}'")
     secret_key_b64 = agent_secret_key_b64(req.agent_id, accounts)
-    return identity.sign_request(secret_key_b64, req.agent_id, req.action, req.amount_usd)
+    return identity.sign_request(
+        secret_key_b64, req.agent_id, req.action, req.amount_usd, req.params
+    )
 
 
 @app.get("/health")
@@ -483,13 +491,106 @@ def demo_restore():
 # ---------------------------------------------------------------------------
 
 
-def _deny(agent_id: str, action: str, amount_usd: float, reason: str, code: str) -> dict:
-    row = storage.log_request(agent_id, action, amount_usd, "denied", reason)
+def _deny(agent_id: str, action: str, amount_usd: float, reason: str, code: str,
+          params: dict | None = None) -> dict:
+    """Record a denial.
+
+    `params` is the arguments the call was for. Denials raised before the
+    schema is resolved (unknown agent, bad signature, frozen, action not
+    allowed) pass the caller's raw params rather than nothing: what an agent
+    *attempted* is part of the record, and "agent_rogue tried to enrich
+    Tesla and was refused" is the sentence an operator needs, not
+    "agent_rogue was refused."
+    """
+    row = storage.log_request(agent_id, action, amount_usd, "denied", reason, params=params)
     anchor.maybe_auto_anchor()
     return {"decision": "denied", "reason": reason, "code": code, "log": row}
 
 
-def _execute_payment(agent_id: str, action: str, action_cfg: dict, reservation_id: int) -> dict:
+def _resolve_params(action_cfg: dict, supplied: dict | None) -> tuple[dict, str | None]:
+    """Validate call arguments against the action's declared schema and fill
+    in defaults. Returns (resolved, error) -- error is None when valid.
+
+    This is a governance control, not input sanitation. Now that the paid
+    APIs take arguments, "how much may this agent spend" stops being the
+    whole question: an agent with a perfectly ordinary budget can still call
+    an action with arguments nobody sanctioned. Declaring the accepted
+    params per action in policy.json means the operator decides the shape of
+    the call, not just its price, and an unknown key is a denial rather than
+    something quietly forwarded to the upstream.
+
+    Defaults come from policy (operator-controlled), never from the caller,
+    so filling one in after signature verification can't be used to smuggle
+    a value past the signature -- the agent has no influence over it.
+    """
+    schema = action_cfg.get("params") or {}
+    supplied = supplied or {}
+
+    unknown = set(supplied) - set(schema)
+    if unknown:
+        return {}, f"unknown parameter(s) for this action: {', '.join(sorted(unknown))}"
+
+    resolved: dict[str, str] = {}
+    for name, spec in schema.items():
+        value = supplied.get(name)
+        if value is None or value == "":
+            value = spec.get("default")
+        if value is None or value == "":
+            if spec.get("required"):
+                return {}, f"missing required parameter '{name}'"
+            continue
+        value = str(value)
+        max_length = spec.get("max_length")
+        if max_length is not None and len(value) > max_length:
+            return {}, f"parameter '{name}' exceeds {max_length} characters"
+        resolved[name] = value
+
+    return resolved, None
+
+
+def _classify_failure(status_code: int, body: str) -> tuple[str, str]:
+    """Turn a non-2xx from the resource server into (code, description).
+
+    Worth separating because these have completely different operators and
+    completely different fixes. A 402 means the payment leg broke -- the
+    facilitator, the chain, the agent's balance. A 5xx carrying an upstream
+    code means the vendor behind the paywall is down, which is nothing to do
+    with payments at all. Reporting both as "settlement failed" (which this
+    did before the APIs were real, when the only route to a non-2xx *was* a
+    payment problem) sends whoever is on call to the wrong system.
+
+    None of these cost the agent anything: the x402 middleware settles only
+    after a handler returns under 400, so every status here means no
+    payment was taken.
+    """
+    detail = ""
+    upstream_code = ""
+    try:
+        parsed = json.loads(body).get("detail")
+        if isinstance(parsed, dict):
+            upstream_code = parsed.get("code", "")
+            detail = parsed.get("message", "")
+        elif isinstance(parsed, str):
+            detail = parsed
+    except (ValueError, AttributeError):
+        detail = body[:200]
+
+    if status_code == 402:
+        return "settlement_failed", f"x402 payment did not settle: {detail or body[:200]}"
+    if status_code == 403:
+        return "policy_auth_failed", f"resource server rejected this engine's authorization: {detail}"
+    if status_code == 404:
+        return "upstream_not_found", detail or "the upstream has no record matching that request"
+    if 400 <= status_code < 500:
+        return "bad_request", detail or f"resource server rejected the request ({status_code})"
+    return (
+        upstream_code or "upstream_unavailable",
+        detail or f"the paid API's upstream is unavailable ({status_code})",
+    )
+
+
+def _execute_payment(agent_id: str, action: str, action_cfg: dict, reservation_id: int,
+                     params: dict | None = None) -> dict:
     """Runs the x402 payment loop for a reservation that has cleared policy.
 
     Shared by /spend (the straight-through path) and the approval-hold
@@ -509,6 +610,14 @@ def _execute_payment(agent_id: str, action: str, action_cfg: dict, reservation_i
         return {"decision": "denied", "reason": reason, "code": "payment_setup_failed", "log": row}
 
     url = RESOURCE_SERVER_URL.rstrip("/") + action_cfg["resource_path"]
+    # Query string baked into the URL rather than passed as requests'
+    # `params=`. The x402 client re-issues this request after paying the
+    # 402, and building the URL here means the arguments are part of the URL
+    # being retried instead of depending on the retry path to carry a
+    # separate params dict through. A paid call that silently lost its
+    # arguments would charge the agent and return the wrong city.
+    if params:
+        url += "?" + urlencode(params)
     # Proves to the resource server that THIS specific spend cleared policy
     # (see common/policy_auth.py) -- without it, the resource server has no
     # idea this engine exists and would sell the same API call to anyone
@@ -526,16 +635,16 @@ def _execute_payment(agent_id: str, action: str, action_cfg: dict, reservation_i
         # 30s combined under real (if degraded) network conditions -- see
         # README "Known limitations" #3. This doesn't make that dependency
         # any less real, it just stops treating "slow" the same as "broken."
-        response = session.get(url, headers=auth_headers, timeout=60)
+        response = session.get(url, headers=auth_headers, timeout=config.OUTBOUND_TIMEOUT_SECONDS)
     except Exception as e:
         reason = f"payment request failed: {e}"
         row = storage.finalize(reservation_id, "denied", reason)
         return {"decision": "denied", "reason": reason, "code": "payment_failed", "log": row}
 
     if not response.ok:
-        reason = f"x402 payment did not settle (status {response.status_code}): {response.text[:200]}"
+        code, reason = _classify_failure(response.status_code, response.text)
         row = storage.finalize(reservation_id, "denied", reason)
-        return {"decision": "denied", "reason": reason, "code": "settlement_failed", "log": row}
+        return {"decision": "denied", "reason": reason, "code": code, "log": row}
 
     # response.ok means the resource server already ran verify()+settle()
     # against the facilitator before returning 200 -- money has moved on
@@ -554,7 +663,7 @@ def _execute_payment(agent_id: str, action: str, action_cfg: dict, reservation_i
         settle = http_client.get_payment_settle_response(lambda name: response.headers.get(name))
         settle_data = json.loads(settle.model_dump_json())
         tx_id = settle_data.get("transaction")
-        explorer_url = EXPLORER_TX_URL.format(tx_id) if tx_id else None
+        explorer_url = config.explorer_url(tx_id)
     except Exception as e:
         reason = (
             f"approved: {action} within policy for '{agent_id}' "
@@ -591,12 +700,12 @@ def spend(req: SpendRequest):
     # 1. Known agent?
     agent_cfg = policy["agents"].get(agent_id)
     if agent_cfg is None:
-        return _deny(agent_id, action, 0.0, f"unknown agent '{agent_id}'", "unknown_agent")
+        return _deny(agent_id, action, 0.0, f"unknown agent '{agent_id}'", "unknown_agent", req.params)
 
     # 2. Known action?
     action_cfg = policy["actions"].get(action)
     if action_cfg is None:
-        return _deny(agent_id, action, 0.0, f"unknown action '{action}'", "unknown_action")
+        return _deny(agent_id, action, 0.0, f"unknown action '{action}'", "unknown_action", req.params)
 
     amount_usd = req.amount_usd if req.amount_usd is not None else action_cfg["price_usd"]
 
@@ -612,16 +721,20 @@ def spend(req: SpendRequest):
     except (KeyError, OSError, ValueError):
         return _deny(
             agent_id, action, amount_usd,
-            f"no known signing key on file for '{agent_id}'", "no_signing_key",
+            f"no known signing key on file for '{agent_id}'", "no_signing_key", req.params,
         )
 
+    # Verified against params EXACTLY as supplied, before any default is
+    # filled in -- the signature has to cover what the caller actually sent,
+    # not what policy later turned it into.
     sig_ok, sig_reason = identity.verify_request(
-        claimed_address, agent_id, action, amount_usd, req.timestamp, req.nonce, req.signature
+        claimed_address, agent_id, action, amount_usd, req.timestamp, req.nonce, req.signature,
+        req.params,
     )
     if not sig_ok:
         return _deny(
             agent_id, action, amount_usd,
-            f"identity verification failed: {sig_reason}", "identity_failed",
+            f"identity verification failed: {sig_reason}", "identity_failed", req.params,
         )
 
     # 4. Kill switch. Checked immediately after identity and before every
@@ -631,6 +744,7 @@ def spend(req: SpendRequest):
         return _deny(
             agent_id, action, amount_usd,
             f"agent '{agent_id}' is frozen -- kill switch engaged by an operator", "frozen",
+            req.params,
         )
 
     # 5. Action approved for this agent?
@@ -638,18 +752,29 @@ def spend(req: SpendRequest):
         return _deny(
             agent_id, action, amount_usd,
             f"agent '{agent_id}' is not approved for action '{action}'", "action_not_allowed",
+            req.params,
         )
 
-    # 6. Per-request spend limit
+    # 6. Call arguments valid for this action? Evaluated once the agent is
+    # known to be allowed the action at all, and before any budget is
+    # touched -- a malformed call shouldn't reserve money it can't spend.
+    params, param_error = _resolve_params(action_cfg, req.params)
+    if param_error:
+        return _deny(
+            agent_id, action, amount_usd,
+            f"invalid call parameters: {param_error}", "invalid_params", req.params,
+        )
+
+    # 7. Per-request spend limit
     if amount_usd > agent_cfg["per_request_limit_usd"]:
         return _deny(
             agent_id, action, amount_usd,
             f"${amount_usd:.2f} exceeds per-request limit "
             f"${agent_cfg['per_request_limit_usd']:.2f} for '{agent_id}'",
-            "over_per_request_limit",
+            "over_per_request_limit", params,
         )
 
-    # 7. Velocity. A daily cap bounds total damage but says nothing about
+    # 8. Velocity. A daily cap bounds total damage but says nothing about
     # rate: an agent stuck in a retry loop can burn a whole day's budget in
     # seconds, and every one of those calls is individually within policy.
     # This is the check that catches "correct but runaway", which is the
@@ -662,10 +787,10 @@ def spend(req: SpendRequest):
                 agent_id, action, amount_usd,
                 f"velocity limit hit: {recent} requests in the last {VELOCITY_WINDOW_SECONDS}s "
                 f"(max {rpm_limit}/min for '{agent_id}')",
-                "over_velocity_limit",
+                "over_velocity_limit", params,
             )
 
-    # 8. Human-in-the-loop threshold. Above this, policy alone isn't allowed
+    # 9. Human-in-the-loop threshold. Above this, policy alone isn't allowed
     # to authorize the spend -- it gets parked holding its budget until a
     # person releases or rejects it. Deliberately evaluated BEFORE the cap
     # reservation returns to the caller, so a parked request can't be
@@ -673,7 +798,7 @@ def spend(req: SpendRequest):
     approval_threshold = agent_cfg.get("require_approval_above_usd")
     needs_approval = approval_threshold is not None and amount_usd > approval_threshold
 
-    # 9. Daily cap -- atomically checked and reserved in one transaction, so
+    # 10. Daily cap -- atomically checked and reserved in one transaction, so
     # two concurrent /spend calls for the same agent (double-click, two
     # tabs, autoplay overlapping a manual fire) can't both read the same
     # "spent so far" and both slip under the cap. See storage.try_reserve.
@@ -683,6 +808,7 @@ def spend(req: SpendRequest):
         amount_usd,
         agent_cfg["daily_cap_usd"],
         decision="awaiting_approval" if needs_approval else "pending",
+        params=params,
     )
     if reservation is None:
         spent_today = storage.get_daily_spend(agent_id, _today())
@@ -690,7 +816,7 @@ def spend(req: SpendRequest):
             agent_id, action, amount_usd,
             f"${spent_today:.2f} spent today + ${amount_usd:.2f} would exceed "
             f"daily cap ${agent_cfg['daily_cap_usd']:.2f} for '{agent_id}'",
-            "over_daily_cap",
+            "over_daily_cap", params,
         )
 
     if needs_approval:
@@ -708,7 +834,7 @@ def spend(req: SpendRequest):
             "log": row,
         }
 
-    result = _execute_payment(agent_id, action, action_cfg, reservation["id"])
+    result = _execute_payment(agent_id, action, action_cfg, reservation["id"], params)
     anchor.maybe_auto_anchor()
     return result
 
@@ -738,8 +864,18 @@ def approve_hold(request_id: int):
         storage.append_event("approval.blocked", {"request_id": request_id, "reason": reason})
         return {"decision": "denied", "reason": reason, "log": storage.finalize(request_id, "denied", reason)}
 
-    storage.append_event("approval.granted", {"request_id": request_id, "agent_id": row["agent_id"]})
-    result = _execute_payment(row["agent_id"], row["action"], action_cfg, request_id)
+    # The arguments this hold was created with, not a fresh resolution. A
+    # reviewer approved a specific call -- "enrich Apple Inc." -- and if
+    # policy's default changed while it sat in the queue, re-deriving here
+    # would spend their approval on a different request than the one they
+    # actually saw.
+    params = json.loads(row.get("params") or "{}")
+
+    storage.append_event(
+        "approval.granted",
+        {"request_id": request_id, "agent_id": row["agent_id"], "params": params},
+    )
+    result = _execute_payment(row["agent_id"], row["action"], action_cfg, request_id, params)
     anchor.maybe_auto_anchor()
     return result
 
@@ -763,4 +899,4 @@ def reject_hold(request_id: int):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=4022)
+    uvicorn.run(app, host=config.BIND_HOST, port=config.POLICY_ENGINE_PORT)

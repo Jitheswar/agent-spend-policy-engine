@@ -3,7 +3,7 @@
 Usage:
     python scripts/setup_accounts.py generate      # create keys (idempotent)
     python scripts/setup_accounts.py balances       # show ALGO/USDC balances + opt-in status
-    python scripts/setup_accounts.py optin          # opt every account into testnet USDC (ASA 10458941)
+    python scripts/setup_accounts.py optin          # opt every account into the network's USDC ASA
 """
 
 import base64
@@ -15,18 +15,41 @@ import algosdk
 from algosdk.v2client import algod
 from algosdk.transaction import AssetTransferTxn
 
-ACCOUNTS_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "accounts.json")
-VERIFIED_MARKER_PATH = os.path.join(os.path.dirname(__file__), "..", "data", ".setup_verified")
-ALGOD_URL = "https://testnet-api.algonode.cloud"
-USDC_TESTNET_ASA_ID = 10458941
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Every named account we need for the demo: one receiver (resource server payee)
-# and three agents (payers/signers) driving the mock scenarios.
-ACCOUNT_NAMES = ["server", "agent_weather", "agent_enrichment", "agent_rogue"]
+from common import config  # noqa: E402
+
+ACCOUNTS_PATH = config.ACCOUNTS_PATH
+VERIFIED_MARKER_PATH = config.SETUP_VERIFIED_PATH
+ALGOD_URL = config.ALGOD_URL
+USDC_TESTNET_ASA_ID = config.USDC_ASA_ID
+
+# The treasury: receives every payment, and funds newly onboarded agents.
+# Needs ALGO (it pays anchoring and provisioning fees) but never needs USDC.
+TREASURY_ACCOUNT = config.ANCHOR_ACCOUNT
+
+
+def account_names() -> list[str]:
+    """Which accounts need to exist: the treasury, plus every agent policy
+    knows about.
+
+    Read from policy.json rather than kept as a list here. That list had
+    already drifted -- accounts.json held two agents policy.json had never
+    heard of -- and two sources of truth for "who are the agents" means one
+    of them is always the wrong one to have edited. Agents onboarded at
+    runtime land in policy.json too (see policy_store.add_agent), so they
+    show up here automatically rather than being invisible to `balances`.
+    """
+    try:
+        with open(config.POLICY_PATH) as f:
+            agents = list(json.load(f).get("agents", {}))
+    except (OSError, json.JSONDecodeError):
+        agents = []
+    return [TREASURY_ACCOUNT] + [a for a in agents if a != TREASURY_ACCOUNT]
 
 
 def get_algod() -> algod.AlgodClient:
-    return algod.AlgodClient("", ALGOD_URL)
+    return algod.AlgodClient(config.ALGOD_TOKEN, ALGOD_URL)
 
 
 def _fetch_account_info(client: algod.AlgodClient, addr: str, attempts: int = 3, timeout: int = 12) -> dict:
@@ -60,7 +83,10 @@ def save_accounts(accounts: dict) -> None:
 def generate() -> None:
     accounts = load_accounts()
     changed = False
-    for name in ACCOUNT_NAMES:
+    # Existing entries are never removed, even if policy no longer lists
+    # them: the account may hold funds, and losing its key to a config edit
+    # would strand them.
+    for name in account_names():
         if name in accounts:
             continue
         sk, addr = algosdk.account.generate_account()
@@ -77,12 +103,26 @@ def generate() -> None:
     print(f"Accounts stored at {os.path.abspath(ACCOUNTS_PATH)}\n")
     for name, info in accounts.items():
         print(f"[{name}] {info['address']}")
+    print("\nThese hold nothing yet, and payments fail until they do.")
+    if config.FAUCETS:
+        print(
+            "Fund every address above. Both faucets need a human (sign-in +\n"
+            "captcha, which is why this step can't be scripted):\n"
+        )
+        for label, url in config.FAUCETS:
+            print(f"  {label:30s}: {url}")
+    else:
+        print(
+            f"There is no faucet on {config.NETWORK} -- fund these from an exchange\n"
+            "or a wallet you already control."
+        )
     print(
-        "\nFund every address above via the official Algorand TestNet Dispenser:\n"
-        "  https://bank.testnet.algorand.network/\n"
-        "It gives 5 ALGO + 100 USDC per address per 24h (Google sign-in + captcha, "
-        "so this step needs a human).\n"
-        "After funding, run: python scripts/setup_accounts.py optin"
+        f"\nEvery address needs both assets, '{TREASURY_ACCOUNT}' included -- it pays\n"
+        "anchoring fees in ALGO and funds newly onboarded agents out of its own\n"
+        "USDC (see common/provisioning.py).\n"
+        "\nThen: python3 scripts/setup_accounts.py optin"
+        "\n      python3 scripts/setup_accounts.py balances"
+        "\n\nFull walkthrough: GETTING_STARTED.md"
     )
 
 
