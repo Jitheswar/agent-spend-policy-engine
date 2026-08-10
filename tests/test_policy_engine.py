@@ -9,6 +9,7 @@ policy decisions, and the concurrency correctness of the daily cap.
 """
 
 import concurrent.futures
+import json
 import os
 import sys
 import tempfile
@@ -84,16 +85,22 @@ def utc_today() -> str:
 
 
 def test_try_reserve_accepts_within_cap(isolated_db):
-    row = storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)
-    assert row is not None
+    row, rejected = storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)
+    assert rejected is None
     assert row["decision"] == "pending"
     assert storage.get_daily_spend("agent_a", utc_today()) == 0.01
 
 
 def test_try_reserve_rejects_over_cap(isolated_db):
     storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02)
-    row = storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)
+    row, rejected = storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)
     assert row is None
+    # The caller needs the numbers for its denial message, and they have to
+    # come out of the same transaction that made the decision -- re-reading
+    # afterwards reports a total that may already have moved.
+    assert rejected["code"] == "over_daily_cap"
+    assert rejected["spent_today"] == pytest.approx(0.02)
+    assert rejected["cap"] == 0.02
     # The rejected attempt wrote nothing -- spend is still exactly the first call's.
     assert storage.get_daily_spend("agent_a", utc_today()) == 0.02
 
@@ -104,20 +111,85 @@ def test_try_reserve_allows_spending_exactly_up_to_the_cap(isolated_db):
     its second call denied roughly whenever the rounding lands high -- a
     "you have $0.00 of $0.02 left" bug that only shows up for some amounts.
     """
-    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02) is not None
-    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02) is not None
-    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02) is None
+    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)[0] is not None
+    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)[0] is not None
+    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)[0] is None
+
+
+def test_velocity_is_enforced_inside_the_reservation(isolated_db):
+    """The rate limit is decided in the same transaction as the cap.
+
+    It used to be a separate count-then-act in the policy engine, which made
+    the cap race-free and left the limiter -- the control built specifically
+    to stop a runaway loop, i.e. the most concurrent thing an agent does --
+    with a window between reading the count and writing the row.
+    """
+    for _ in range(3):
+        storage.try_reserve("agent_a", "weather", 0.01, 10.0, max_requests_per_minute=3)
+
+    row, rejected = storage.try_reserve("agent_a", "weather", 0.01, 10.0, max_requests_per_minute=3)
+    assert row is None
+    assert rejected["code"] == "over_velocity_limit"
+    assert rejected["recent"] == 3 and rejected["limit"] == 3
+    # Rejected on rate, not budget: there was plenty of cap left.
+    assert storage.get_daily_spend("agent_a", utc_today()) == pytest.approx(0.03)
+
+
+def test_velocity_denial_wins_over_the_cap_when_both_trip(isolated_db):
+    """Which denial an operator sees decides where they go looking. "Going
+    too fast" sends them to a retry loop; "out of budget" sends them to a
+    cap that is doing its job."""
+    storage.try_reserve("agent_a", "weather", 0.02, 0.02, max_requests_per_minute=1)
+    _, rejected = storage.try_reserve("agent_a", "weather", 0.02, 0.02, max_requests_per_minute=1)
+    assert rejected["code"] == "over_velocity_limit"
 
 
 def test_finalize_denied_frees_the_reservation(isolated_db):
     """A reservation whose payment subsequently fails must stop counting
     toward the cap -- otherwise a failed payment permanently burns budget."""
-    row = storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02)
+    row, _ = storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02)
     storage.finalize(row["id"], "denied", "payment request failed: connection refused")
     assert storage.get_daily_spend("agent_a", utc_today()) == 0.0
     # Budget should be available again.
-    retry = storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02)
+    retry, _ = storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02)
     assert retry is not None
+
+
+def test_a_crashed_reservation_stops_holding_budget(isolated_db):
+    """A 'pending' row is a payment in flight. Nothing finalizes one if the
+    process is killed mid-payment, and it counts toward the cap forever --
+    an agent could come back from a crash with part of its budget spoken for
+    by a payment that never happened, curable only by wiping the log.
+    """
+    row, _ = storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02)
+    assert storage.get_daily_spend("agent_a", utc_today()) == 0.02
+    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)[0] is None
+
+    # Nothing in flight can be older than the outbound timeout: that is the
+    # longest a /spend call can possibly still be waiting.
+    reaped = storage.reap_stale_reservations(older_than_seconds=0)
+
+    assert reaped == [row["id"]]
+    assert storage.get_daily_spend("agent_a", utc_today()) == 0.0
+
+    # Recorded, not silently repaired: an abandoned spend is a real thing
+    # that happened to a real reservation, and a ledger that omits it has a
+    # gap exactly where an operator would go looking.
+    assert storage.verify_chain()["ok"] is True
+    latest = json.loads(storage.get_audit_events(limit=1)[0]["payload"])
+    assert latest["decision"] == "denied" and "abandoned" in latest["reason"]
+
+    # And the released budget is genuinely spendable again.
+    assert storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=0.02)[0] is not None
+
+
+def test_reaping_leaves_live_reservations_alone(isolated_db):
+    """A reservation younger than the timeout may still be settling. Freeing
+    its budget would let a concurrent request double-spend against money
+    that is already committed."""
+    row, _ = storage.try_reserve("agent_a", "weather", 0.02, daily_cap_usd=0.02)
+    assert storage.reap_stale_reservations(older_than_seconds=3600) == []
+    assert storage.get_request(row["id"])["decision"] == "pending"
 
 
 def test_concurrent_reservations_never_exceed_cap(isolated_db):
@@ -132,7 +204,7 @@ def test_concurrent_reservations_never_exceed_cap(isolated_db):
     n_requests = 12  # cap has room for exactly 2 of these
 
     def attempt(_):
-        return storage.try_reserve("agent_rogue", "weather", amount, cap)
+        return storage.try_reserve("agent_rogue", "weather", amount, cap)[0]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_requests) as pool:
         results = list(pool.map(attempt, range(n_requests)))
@@ -143,6 +215,24 @@ def test_concurrent_reservations_never_exceed_cap(isolated_db):
     total_reserved = storage.get_daily_spend("agent_rogue", utc_today())
     assert total_reserved == pytest.approx(0.02)
     assert total_reserved <= cap + 1e-9
+
+
+def test_concurrent_requests_never_exceed_the_velocity_limit(isolated_db):
+    """The same race, for the rate limiter. 12 simultaneous requests against
+    a limit of 3: before the check moved inside the transaction, threads
+    could all read the same sub-limit count and all proceed."""
+    limit = 3
+    n_requests = 12
+
+    def attempt(_):
+        return storage.try_reserve(
+            "agent_rogue", "weather", 0.01, 100.0, max_requests_per_minute=limit
+        )[0]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_requests) as pool:
+        results = list(pool.map(attempt, range(n_requests)))
+
+    assert len([r for r in results if r is not None]) == limit
 
 
 @pytest.fixture

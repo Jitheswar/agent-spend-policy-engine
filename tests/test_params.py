@@ -275,3 +275,110 @@ def test_the_params_column_is_added_to_a_pre_existing_database(monkeypatch):
         assert json.loads(storage.get_requests(limit=1)[0]["params"]) == {"city": "Oslo"}
     finally:
         os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# The hard ceiling underneath the policy schema
+# ---------------------------------------------------------------------------
+
+
+def test_an_absurd_parameter_value_is_refused_outright(client):
+    """A denial is written into an append-only ledger with no delete path.
+    That is the point of the ledger, and it is also why an unauthenticated
+    caller must not be able to choose how many bytes go into it: without a
+    ceiling, one /spend request commits an arbitrary blob permanently, and
+    drives auto-anchoring (and its transaction fees) on the way.
+
+    422, not a policy denial: this is malformed input, not a governed call,
+    so it is refused before anything is recorded rather than after.
+    """
+    before = storage.get_event_count()
+    response = client.post(
+        "/spend",
+        json={
+            "agent_id": "nobody",
+            "action": "weather",
+            "params": {"city": "x" * 200_000},
+            "timestamp": 0,
+            "nonce": "n",
+            "signature": "s",
+        },
+    )
+
+    assert response.status_code == 422
+    assert storage.get_event_count() == before, "nothing may reach the ledger"
+
+
+def test_too_many_parameters_are_refused(client):
+    response = client.post(
+        "/spend",
+        json={
+            "agent_id": "nobody",
+            "action": "weather",
+            "params": {f"k{i}": "v" for i in range(200)},
+            "timestamp": 0,
+            "nonce": "n",
+            "signature": "s",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_an_absurd_parameter_name_is_refused(client):
+    response = client.post(
+        "/spend",
+        json={
+            "agent_id": "nobody",
+            "action": "weather",
+            "params": {"k" * 5_000: "v"},
+            "timestamp": 0,
+            "nonce": "n",
+            "signature": "s",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_ordinary_arguments_are_nowhere_near_the_ceiling(no_payment, client):
+    """The ceiling is anti-abuse, not governance: a real call must never
+    come close to it, or it would be doing the policy schema's job badly."""
+    body = signed_body("agent_weather", "weather", 0.01, {"city": "Reykjavik"})
+    assert client.post("/spend", json=body).json()["decision"] == "approved"
+
+
+def test_the_signing_helper_is_bounded_too(client):
+    """/admin/sign takes the same params and would otherwise be a way to
+    hand the engine an unbounded dict through a different door."""
+    response = client.post(
+        "/admin/sign",
+        json={
+            "agent_id": "agent_weather",
+            "action": "weather",
+            "amount_usd": 0.01,
+            "params": {"city": "x" * 200_000},
+        },
+    )
+    assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# List endpoints are bounded
+# ---------------------------------------------------------------------------
+
+
+def test_a_negative_limit_is_refused_rather_than_meaning_unlimited(client):
+    """SQLite reads a negative LIMIT as "no limit", so ?limit=-1 returned
+    the entire table -- and serialised all of it to JSON in memory."""
+    for path in ("/requests", "/audit/events", "/audit/anchors"):
+        assert client.get(f"{path}?limit=-1").status_code == 422, path
+
+
+def test_an_enormous_limit_is_refused(client):
+    for path in ("/requests", "/audit/events", "/audit/anchors"):
+        assert client.get(f"{path}?limit=100000000").status_code == 422, path
+
+
+def test_the_default_and_ordinary_limits_still_work(client):
+    assert client.get("/requests").status_code == 200
+    assert client.get("/requests?limit=50").status_code == 200
+    assert client.get("/audit/events?limit=1000").status_code == 200

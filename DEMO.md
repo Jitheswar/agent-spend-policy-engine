@@ -241,4 +241,15 @@ events rather than on demand. README, limitation 3.
 **"Is the dashboard operator cryptographically the agent?"**
 No. The agents sign for real with their own keys — `agents/simulate.py`
 does exactly that. The dashboard's buttons are a human operator and go
-through a clearly-labeled `/admin/sign` endpoint. README, limitation 2.
+through `/admin/sign`, which is a signing oracle: it will sign as any
+agent. That's why it sits behind the admin token *and* behind
+`ALLOW_DEMO_ENDPOINTS`, which is off by default on mainnet. With it
+disabled, "only a caller holding the agent's key can spend as that agent"
+holds without qualification. README, limitation 2.
+
+**"What stops me curling your kill switch?"**
+Every `/admin` route requires a bearer token — freeze, approve a held
+spend, edit a cap, onboard an agent. `start.sh` generates one and gives it
+to the dashboard, so nothing about the demo changes. `/spend` is
+deliberately still open: anyone may *attempt* a spend, and the signature
+decides whether it succeeds. README, limitation 8.

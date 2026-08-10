@@ -16,3 +16,14 @@ rather than anchor_now(), so they're unaffected by this.
 import os
 
 os.environ.setdefault("ASPE_DISABLE_ANCHOR", "1")
+
+# Admin auth off by default, so the existing suite can drive /admin routes
+# (freeze, holds, onboarding, the tamper demo) without threading a bearer
+# token through every request -- those tests are about what the routes DO.
+# An empty ADMIN_TOKEN is the documented "no authentication" setting; see
+# common/config.admin_token(). Enforcement itself is tested for real in
+# tests/test_admin_auth.py, which switches it on.
+#
+# Set before any test module imports common.config, because config reads it
+# once at import to decide between "generate a token" and "explicitly off".
+os.environ.setdefault("ADMIN_TOKEN", "")

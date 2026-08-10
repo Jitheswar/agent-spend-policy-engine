@@ -129,6 +129,11 @@ def _write_locked(data: dict) -> None:
     tmp_path = POLICY_PATH + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(data, f, indent=2)
+        # Trailing newline, because this file is committed AND edited live.
+        # json.dump doesn't write one, so every freeze or cap change showed
+        # up in `git diff` as "\ No newline at end of file" -- a spurious
+        # change on a file whose real diffs are the ones worth reading.
+        f.write("\n")
     os.replace(tmp_path, POLICY_PATH)  # atomic on POSIX
     _cache["data"] = data
     _cache["mtime"] = os.path.getmtime(POLICY_PATH)

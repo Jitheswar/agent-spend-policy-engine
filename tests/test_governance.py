@@ -335,6 +335,74 @@ def test_freezing_an_agent_blocks_its_already_queued_holds(client, monkeypatch):
     assert "was frozen while this request was awaiting approval" in body["reason"]
 
 
+def test_deregistering_an_agent_blocks_its_already_queued_holds(client, monkeypatch):
+    """Deregistering an agent is strictly stronger than freezing it -- the
+    agent stops existing. It would be absurd for the weaker statement to
+    stop a queued spend and the stronger one to let it through, but that is
+    what happened: the release path looked the agent up with a `{}` default
+    and read "not frozen" off the empty dict.
+    """
+    from policy_engine import app as app_module
+
+    patch_agent(monkeypatch, "agent_weather", require_approval_above_usd=0.005)
+    held = client.post("/spend", json=signed_body("agent_weather", "weather", 0.01)).json()
+
+    real = app_module.policy_store.get_policy()
+    without = {**real, "agents": {k: v for k, v in real["agents"].items() if k != "agent_weather"}}
+    monkeypatch.setattr(app_module.policy_store, "get_policy", lambda: without)
+    monkeypatch.setattr(app_module, "_execute_payment", lambda *a, **kw: pytest.fail("payment must not run"))
+
+    body = client.post(f"/admin/holds/{held['request_id']}/approve").json()
+    assert body["decision"] == "denied"
+    assert body["code"] == "approval_blocked"
+    assert "deregistered while this request was awaiting approval" in body["reason"]
+
+
+def test_revoking_the_action_blocks_its_already_queued_holds(client, monkeypatch):
+    """The reviewer is approving an AMOUNT. They are not re-granting the
+    permission to make the call at all, so an action revoked while the hold
+    sat in the queue has to reach it."""
+    from policy_engine import app as app_module
+
+    patch_agent(monkeypatch, "agent_weather", require_approval_above_usd=0.005)
+    held = client.post("/spend", json=signed_body("agent_weather", "weather", 0.01)).json()
+
+    patch_agent(monkeypatch, "agent_weather", require_approval_above_usd=0.005, allowed_actions=[])
+    monkeypatch.setattr(app_module, "_execute_payment", lambda *a, **kw: pytest.fail("payment must not run"))
+
+    body = client.post(f"/admin/holds/{held['request_id']}/approve").json()
+    assert body["decision"] == "denied"
+    assert "no longer approved" in body["reason"]
+
+
+def test_a_blocked_release_frees_the_budget_it_was_holding(client, monkeypatch):
+    """Whatever stops the release, the reservation must resolve -- a hold
+    that stays 'awaiting_approval' after being refused would go on counting
+    against the cap forever."""
+    from policy_engine import app as app_module
+
+    patch_agent(monkeypatch, "agent_weather", require_approval_above_usd=0.005)
+    held = client.post("/spend", json=signed_body("agent_weather", "weather", 0.01)).json()
+
+    patch_agent(monkeypatch, "agent_weather", require_approval_above_usd=0.005, frozen=True)
+    client.post(f"/admin/holds/{held['request_id']}/approve")
+
+    assert storage.get_request(held["request_id"])["decision"] == "denied"
+    assert storage.get_pending_approvals() == []
+
+
+def test_a_blocked_release_is_audited(client, monkeypatch):
+    patch_agent(monkeypatch, "agent_weather", require_approval_above_usd=0.005)
+    held = client.post("/spend", json=signed_body("agent_weather", "weather", 0.01)).json()
+
+    patch_agent(monkeypatch, "agent_weather", require_approval_above_usd=0.005, allowed_actions=[])
+    client.post(f"/admin/holds/{held['request_id']}/approve")
+
+    types = [e["event_type"] for e in storage.get_audit_events(limit=20)]
+    assert "approval.blocked" in types
+    assert storage.verify_chain()["ok"] is True
+
+
 def test_a_hold_cannot_be_approved_twice(client, monkeypatch):
     from policy_engine import app as app_module
 

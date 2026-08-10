@@ -30,12 +30,10 @@ import threading
 
 import algosdk
 from algosdk.transaction import AssetTransferTxn, PaymentTxn, wait_for_confirmation
-from algosdk.v2client import algod
 
-from common import config
+from common import algod, config
 
 ACCOUNTS_PATH = config.ACCOUNTS_PATH
-ALGOD_URL = config.ALGOD_URL
 USDC_ASA_ID = config.USDC_ASA_ID
 
 # Enough ALGO to cover the 0.1 minimum balance, the extra 0.1 minimum an ASA
@@ -112,11 +110,11 @@ def ensure_account(agent_id: str) -> tuple[str, bool]:
         return address, True
 
 
-def _algod() -> algod.AlgodClient:
-    return algod.AlgodClient("", ALGOD_URL)
+def _algod():
+    return algod.client()
 
 
-def _balances(client: algod.AlgodClient, address: str) -> tuple[int, int | None]:
+def _balances(client, address: str) -> tuple[int, int | None]:
     """(microALGO, microUSDC or None if not opted in)."""
     try:
         info = client.account_info(address)

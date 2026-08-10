@@ -1,3 +1,27 @@
-x402-avm[fastapi,avm,requests,httpx]
-uvicorn
-pytest
+# Pinned deliberately, and to exact versions.
+#
+# start.sh runs `pip install` on every launch, so an unpinned dependency
+# means the software demoed is whatever PyPI happened to be serving that
+# morning. tests/test_upstreams.py exists precisely because a dependency
+# upgrade could quietly reverse the settle-only-on-success behaviour the
+# no-charge guarantee rests on -- that test catches the reversal, but
+# nothing was stopping the upgrade from landing an hour before it mattered.
+#
+# To move a pin: bump it here, run `pytest tests/ -v`, and read what breaks.
+
+x402-avm[fastapi,avm,requests,httpx]==2.0.2
+
+# Transitively required by x402-avm, pinned because the three things this
+# project asserts about its dependencies all live in them: the payment
+# middleware settling only after a <400 response (x402 + starlette), the
+# request schema bounds (pydantic), and the Algorand signing/anchoring
+# primitives (py-algorand-sdk).
+fastapi==0.141.1
+starlette==1.4.1
+pydantic==2.13.4
+py-algorand-sdk==2.11.1
+requests==2.34.2
+httpx==0.28.1
+
+uvicorn==0.52.1
+pytest==9.1.1

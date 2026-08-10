@@ -313,8 +313,18 @@ uses the new rules. Or from the dashboard, or:
 
 ```bash
 curl -X PATCH http://127.0.0.1:4022/admin/agents/agent_rogue \
+  -H "Authorization: Bearer $(python3 -m common.config --admin-token)" \
   -H 'Content-Type: application/json' -d '{"daily_cap_usd": 0.10}'
 ```
+
+Every `/admin` route needs that header — they are all authority over money,
+so none of them is reachable by anything that can merely open a socket to
+the port. The token is generated on first run into `data/admin_token.txt`
+and `start.sh` hands it to the dashboard, so the buttons in the UI just
+work; you only need it for `curl`. Set `ADMIN_TOKEN` in `.env` to use your
+own, or `ADMIN_TOKEN=` (empty) to turn authentication off on a throwaway
+box. A 401 from one of these routes means the header is missing or stale —
+re-run `start.sh` if the dashboard is the one getting it.
 
 ### Add a new paid API
 
@@ -335,7 +345,7 @@ Three places:
 python3 -m pytest tests/ -v
 ```
 
-127 tests, no network needed — upstreams are mocked and anchoring is
+183 tests, no network needed — upstreams are mocked and anchoring is
 disabled, so a test run never spends anything or calls a vendor.
 
 ---
@@ -466,10 +476,17 @@ Or change the ports in `.env` (`RESOURCE_SERVER_PORT`, etc.).
 <details>
 <summary><code>NETWORK=mainnet moves real funds</code> — it refuses to start</summary>
 
-Deliberate. Mainnet needs `ALLOW_MAINNET=true` set alongside it, because
-this system has **no authentication on its `/admin` routes** — anyone who
-can reach its port can release a held spend or unfreeze an agent. Read
-limitation #8 in the README before you set it.
+Deliberate — real funds shouldn't be reachable by a typo. Set
+`ALLOW_MAINNET=true` alongside it.
+
+Two other things change on mainnet, and both will stop you if they aren't
+right. `ADMIN_TOKEN` may not be explicitly empty: an unauthenticated kill
+switch next to money that's worth something is refused rather than warned
+about. And `ALLOW_DEMO_ENDPOINTS` defaults to off, which disables
+`/admin/sign` — so the dashboard's Fire buttons stop working, because they
+depend on the engine signing on an agent's behalf. That's correct: on
+mainnet a real agent signs for itself. Read limitations #2 and #8 in the
+README before you set any of it.
 </details>
 
 <details>
@@ -496,7 +513,8 @@ payments into false denials.
 **Stop the services:** `Ctrl+C` in the terminal running `start.sh`.
 
 **Clear the request feed** for a fresh demo: the **Reset log** button, or
-`curl -X POST http://127.0.0.1:4022/admin/reset`. This deliberately does
+`curl -X POST http://127.0.0.1:4022/admin/reset -H "Authorization: Bearer
+$(python3 -m common.config --admin-token)"`. This deliberately does
 *not* clear the audit ledger — the reset itself is recorded as an event in
 it. An audit trail a button can erase wouldn't be one.
 

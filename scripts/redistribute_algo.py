@@ -7,22 +7,19 @@ between accounts we already control.
 """
 
 import argparse
-import base64
 import json
 import os
 
 import sys
 
 import algosdk
-from algosdk.v2client import algod
 from algosdk.transaction import PaymentTxn
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from common import config  # noqa: E402
+from common import algod, config  # noqa: E402
 
 ACCOUNTS_PATH = config.ACCOUNTS_PATH
-ALGOD_URL = config.ALGOD_URL
 
 
 def main():
@@ -38,7 +35,7 @@ def main():
     sender_addr = sender_info["address"]
     sender_sk = algosdk.mnemonic.to_private_key(sender_info["mnemonic"])
 
-    client = algod.AlgodClient("", ALGOD_URL)
+    client = algod.client()
     params = client.suggested_params()
     micro_amount = int(args.amount * 1_000_000)
 

@@ -1526,6 +1526,11 @@ main {
   text-overflow: ellipsis;
 }
 .fact-value.mono { font-family: var(--font-mono); font-size: 0.78rem; }
+/* The unanchored-event count once it has reached the auto-anchor threshold:
+   an anchor is due or in flight, so the window is at its widest. Amber, not
+   red -- nothing is wrong, there is simply more history than usual resting
+   on the local chain alone. */
+.fact-value.is-warn { color: var(--warn); }
 .fact-value a {
   display: inline-flex;
   align-items: center;

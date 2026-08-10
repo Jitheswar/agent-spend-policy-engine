@@ -1,4 +1,14 @@
+// Both come from dashboard/config.js, which start.sh generates from the
+// resolved configuration (see `python3 -m common.config --export`). It's
+// gitignored and absent if you open these files without start.sh, hence the
+// fallbacks -- the port one is only correct for the default configuration,
+// which is exactly why the generated file exists.
 const POLICY_ENGINE_URL = window.POLICY_ENGINE_URL || "http://127.0.0.1:4022";
+// Every /admin route needs this. The dashboard is served from localhost by
+// dashboard/serve.py, off the same disk the token lives on, so handing it
+// to the page is the same trust boundary the policy-auth secret already
+// uses -- it is not a claim that the browser is a separate principal.
+const ADMIN_TOKEN = window.ADMIN_TOKEN || "";
 
 const agentsEl = document.getElementById("agents");
 const feedBodyEl = document.getElementById("feedBody");
@@ -27,6 +37,7 @@ const integrityEls = {
   events: document.getElementById("integrityEvents"),
   head: document.getElementById("integrityHead"),
   anchor: document.getElementById("integrityAnchor"),
+  exposure: document.getElementById("integrityExposure"),
 };
 
 const statEls = {
@@ -120,7 +131,14 @@ function decisionLabel(decision) {
 function escapeHtml(value) {
   const div = document.createElement("div");
   div.textContent = value === null || value === undefined ? "" : String(value);
-  return div.innerHTML;
+  // The browser's serializer escapes &, <, > and U+00A0 -- and NOT quotes,
+  // because it is serializing a text node, where quotes need no escaping.
+  // Several call sites below interpolate into a quoted ATTRIBUTE, where an
+  // unescaped " closes the attribute and everything after it is parsed as
+  // markup. So the two quote characters are handled here rather than at
+  // each of those call sites, because "remember this one is an attribute"
+  // is not a rule that survives the next edit.
+  return div.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 // The request row carries params as a canonical JSON string (see the params
@@ -138,9 +156,34 @@ function paramSummary(raw) {
   }
 }
 
-async function fetchJSON(path, options) {
-  const res = await fetch(`${POLICY_ENGINE_URL}${path}`, options);
-  if (!res.ok) throw new Error(`${path} -> ${res.status}`);
+class HttpError extends Error {
+  constructor(path, status, message, body) {
+    super(message);
+    this.status = status;
+    this.path = path;
+    this.body = body;
+  }
+}
+
+async function fetchJSON(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  if (path.startsWith("/admin") && ADMIN_TOKEN) {
+    headers.Authorization = `Bearer ${ADMIN_TOKEN}`;
+  }
+  const res = await fetch(`${POLICY_ENGINE_URL}${path}`, { ...options, headers });
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    // 401 on an admin route has one cause worth naming, because the symptom
+    // (a button that does nothing) points nowhere: the page was loaded
+    // without dashboard/config.js, so it has no token to send.
+    const message =
+      res.status === 401
+        ? ADMIN_TOKEN
+          ? "the admin token this page holds was rejected — restart start.sh to refresh it"
+          : "this page has no admin token — open the dashboard via ./start.sh, which generates config.js"
+        : body?.detail?.message || body?.detail || body?.error || `${path} -> ${res.status}`;
+    throw new HttpError(path, res.status, String(message), body);
+  }
   return res.json();
 }
 
@@ -921,6 +964,19 @@ function renderIntegrity(report, { authoritative }) {
   integrityEls.head.textContent = head ? `${head.slice(0, 10)}…` : "—";
   integrityEls.head.title = head ? `seq ${report.chain.head_seq} · ${head}` : "the ledger is empty";
 
+  // How much history is currently protected only by the local hash chain.
+  // Named rather than hidden: it is the exact size of the one gap the
+  // design cannot close by hashing alone, and it drops to zero on every
+  // anchor, which is the argument for anchoring automatically.
+  const unanchored = report.unanchored_events;
+  integrityEls.exposure.textContent =
+    unanchored === 0 ? "none" : `${unanchored} event${unanchored === 1 ? "" : "s"}`;
+  integrityEls.exposure.title =
+    unanchored === 0
+      ? "every event is covered by an on-chain anchor"
+      : `${unanchored} event(s) appended since the last anchor — notarized automatically at ${report.auto_anchor_threshold}`;
+  integrityEls.exposure.classList.toggle("is-warn", unanchored >= report.auto_anchor_threshold);
+
   const latest = report.anchors[0];
   if (!latest) {
     integrityEls.anchor.textContent = "never";
@@ -1109,6 +1165,13 @@ async function fireSpend(agentId, action, btn, amountUsd) {
       // /spend rejects unknown agents before it ever looks at the
       // signature, so the denial still shows up correctly in the feed
       // instead of the request silently never happening.
+      //
+      // ONLY for that case. This used to swallow everything, so an engine
+      // that was down, or an admin token that was rejected, came back as
+      // `identity_failed` from the unsigned request that followed --
+      // pointing at the cryptography when the problem was the network.
+      const isUnknownAgent = signErr.status === 404 && signErr.body?.error !== "not enabled";
+      if (!isUnknownAgent) throw signErr;
       signed = { timestamp: Date.now() / 1000, nonce: "n/a", signature: "n/a" };
     }
     const result = await fetchJSON("/spend", {

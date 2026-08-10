@@ -18,15 +18,18 @@ verify after the fact that the record wasn't edited.
 
 import json
 import os
+import secrets
 import sys
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 from common import anchor, config, identity, policy_auth, provisioning
 from common.avm_client import agent_address, agent_secret_key_b64, build_paying_session, load_accounts
@@ -34,11 +37,101 @@ from policy_engine import policy_store, storage
 
 RESOURCE_SERVER_URL = config.RESOURCE_SERVER_URL
 
-VELOCITY_WINDOW_SECONDS = 60
+VELOCITY_WINDOW_SECONDS = config.VELOCITY_WINDOW_SECONDS
 
 storage.init_db()
 
 app = FastAPI(title="Agent Spend Policy Engine")
+
+# Endpoints that exist only to make the system demonstrable, and that hand
+# out capabilities no production deployment should: /admin/sign will sign a
+# /spend request as any agent (see admin_sign), and /admin/demo/* doctors
+# audit records. Gated together by ALLOW_DEMO_ENDPOINTS.
+DEMO_PREFIXES = ("/admin/sign", "/admin/demo/")
+
+AUTH_HEADER = "Authorization"
+
+
+class AdminAuthMiddleware(BaseHTTPMiddleware):
+    """Requires a bearer token on every /admin route.
+
+    This is the control the whole product rests on. Everything under
+    /admin is an authority over money -- freeze, unfreeze, onboard, release
+    a held spend, edit a cap -- and for a system whose pitch is "a person
+    decides what the agents may do", leaving that reachable by anything
+    that can open a socket to this port made the pitch untrue.
+
+    Deliberately a middleware rather than a per-route dependency: routes get
+    added, and a dependency you forget to attach fails open. A prefix match
+    here covers every route that exists now and every one added later.
+
+    The token is resolved per request (config.admin_token()) rather than
+    captured at import, so a test can flip it without reloading the app --
+    same reasoning as anchor.anchoring_disabled().
+    """
+
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        if not path.startswith("/admin"):
+            return await call_next(request)
+
+        if any(path.startswith(prefix) for prefix in DEMO_PREFIXES) and not config.ALLOW_DEMO_ENDPOINTS:
+            # 404 rather than 403: an endpoint that is switched off should
+            # look absent, not merely locked.
+            return JSONResponse(
+                {
+                    "error": "not enabled",
+                    "detail": (
+                        "demo-only endpoints are disabled on this deployment "
+                        "(set ALLOW_DEMO_ENDPOINTS=true to enable them)"
+                    ),
+                },
+                status_code=404,
+            )
+
+        # CORS preflight carries no Authorization header by definition; it
+        # has to reach the CORS layer to be answered at all.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        expected = config.admin_token()
+        if not expected:
+            return await call_next(request)
+
+        supplied = request.headers.get(AUTH_HEADER, "")
+        scheme, _, presented = supplied.partition(" ")
+        # Compared as BYTES. secrets.compare_digest refuses non-ASCII str and
+        # raises TypeError, and Starlette decodes header bytes as latin-1 --
+        # so `Authorization: Bearer tökén` over a raw socket turned an
+        # unauthenticated request into a 500 with a traceback instead of a
+        # 401. A wrong credential is a wrong credential; it is never a bug
+        # report. (httpx can't even send that header, so it takes a raw
+        # socket to see it -- which is exactly the caller who would try.)
+        if scheme.lower() != "bearer" or not secrets.compare_digest(
+            presented.strip().encode("utf-8", "surrogateescape"), expected.encode("utf-8")
+        ):
+            return JSONResponse(
+                {
+                    "error": "admin authorization required",
+                    "detail": (
+                        "every /admin route needs 'Authorization: Bearer <ADMIN_TOKEN>'. "
+                        f"The token for this deployment is in {config.ADMIN_TOKEN_PATH} "
+                        "unless ADMIN_TOKEN was set in the environment."
+                    ),
+                },
+                status_code=401,
+            )
+        return await call_next(request)
+
+
+app.add_middleware(AdminAuthMiddleware)
+
+# Added AFTER the auth middleware, which makes it the OUTER layer (Starlette
+# runs add_middleware() registrations last-added-first). That ordering is
+# load-bearing twice over: a preflight OPTIONS is answered here instead of
+# being rejected by auth for carrying no credentials, and a 401 still comes
+# back with CORS headers, so the browser reports "unauthorized" rather than
+# an opaque network error that sends you looking in the wrong place.
 app.add_middleware(
     CORSMiddleware,
     # Only the dashboard's own origin needs cross-origin access. This is
@@ -51,7 +144,7 @@ app.add_middleware(
     # button does nothing, while curl against the same route works fine,
     # which sends you looking in entirely the wrong place.
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", AUTH_HEADER],
 )
 
 # One paying session per agent, built lazily and reused (each holds a
@@ -105,12 +198,52 @@ class SpendRequest(BaseModel):
     nonce: str = Field(max_length=32)
     signature: str = Field(max_length=256)
 
+    @field_validator("params")
+    @classmethod
+    def _bounded_params(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        return _check_param_bounds(value)
+
+
+def _check_param_bounds(value: dict[str, str] | None) -> dict[str, str] | None:
+    """Hard ceiling on call arguments, distinct from the policy check.
+
+    policy.json's per-action `max_length` is the governance control -- an
+    operator deciding what a sanctioned call may look like. This is the
+    anti-abuse floor underneath it, and it exists because of where rejected
+    requests go rather than what they mean.
+
+    /spend is deliberately open to unauthenticated callers: anyone may
+    *attempt* a spend, and the signature decides whether it succeeds. Every
+    attempt, including a denial raised before validation, is written into an
+    append-only ledger with no delete path -- that is the point of the
+    ledger. Without a ceiling here, a single unauthenticated request could
+    commit an arbitrary number of attacker-chosen bytes to it permanently,
+    and drive auto-anchoring (and its transaction fees) while doing so.
+    """
+    if value is None:
+        return None
+    if len(value) > config.MAX_PARAM_KEYS:
+        raise ValueError(f"at most {config.MAX_PARAM_KEYS} parameters are accepted")
+    for key, item in value.items():
+        if len(key) > config.MAX_PARAM_KEY_LENGTH:
+            raise ValueError(f"parameter names are limited to {config.MAX_PARAM_KEY_LENGTH} characters")
+        if len(item) > config.MAX_PARAM_VALUE_LENGTH:
+            raise ValueError(
+                f"parameter '{key[:32]}' exceeds the {config.MAX_PARAM_VALUE_LENGTH}-character ceiling"
+            )
+    return value
+
 
 class SignRequest(BaseModel):
     agent_id: str = Field(max_length=128)
     action: str = Field(max_length=128)
     amount_usd: float = Field(ge=0, le=1000)
     params: dict[str, str] | None = None
+
+    @field_validator("params")
+    @classmethod
+    def _bounded_params(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        return _check_param_bounds(value)
 
 
 @app.post("/admin/sign")
@@ -126,6 +259,14 @@ def admin_sign(req: SignRequest):
     operator -- it proves the SAME thing agents/simulate.py's local
     signing proves, just performed on the caller's behalf as a demo
     convenience.
+
+    Be precise about what this route is, because it is the hinge the
+    identity guarantee turns on: it is a signing oracle. It will sign for
+    ANY agent. While it is reachable, "only a caller who holds an agent's
+    private key can spend as that agent" is true only of callers who also
+    lack the admin token -- which is exactly why it sits behind both
+    AdminAuthMiddleware and ALLOW_DEMO_ENDPOINTS, and why the second of
+    those defaults off on mainnet.
     """
     accounts = load_accounts()
     if req.agent_id not in accounts:
@@ -155,6 +296,24 @@ class AgentPolicyUpdate(BaseModel):
     require_approval_above_usd: float | None = Field(default=None, ge=0, le=1000)
 
 
+def _reject_unknown_actions(actions: list[str] | None) -> None:
+    """Both routes that accept an allowed_actions list run this.
+
+    POST /admin/agents validated it and PATCH didn't, which is the kind of
+    asymmetry that looks harmless until you notice what it lets through: an
+    arbitrary attacker-chosen string written straight into policy.json, and
+    from there into the dashboard's markup. An action nothing can serve is
+    also just wrong on its own terms -- it grants an authority that cannot
+    be exercised and reads, in the audit log, as if it could.
+    """
+    if not actions:
+        return
+    known = policy_store.get_policy()["actions"]
+    unknown = [a for a in actions if a not in known]
+    if unknown:
+        raise HTTPException(400, f"unknown action(s): {', '.join(unknown)}")
+
+
 @app.patch("/admin/agents/{agent_id}")
 def update_agent_policy(agent_id: str, update: AgentPolicyUpdate):
     """Live policy edit -- takes effect immediately, no restart, and
@@ -162,6 +321,7 @@ def update_agent_policy(agent_id: str, update: AgentPolicyUpdate):
     fields = {k: v for k, v in update.model_dump().items() if v is not None}
     if not fields:
         raise HTTPException(400, "no fields to update")
+    _reject_unknown_actions(fields.get("allowed_actions"))
     try:
         updated = policy_store.update_agent(agent_id, **fields)
     except KeyError:
@@ -209,9 +369,7 @@ def create_agent(req: NewAgentRequest):
     over -- an agent that looks ready and then fails to pay is a worse
     demo, and a worse system, than one that says what it's doing.
     """
-    unknown_actions = [a for a in req.allowed_actions if a not in policy_store.get_policy()["actions"]]
-    if unknown_actions:
-        raise HTTPException(400, f"unknown action(s): {', '.join(unknown_actions)}")
+    _reject_unknown_actions(req.allowed_actions)
 
     try:
         address, created = provisioning.ensure_account(req.agent_id)
@@ -335,7 +493,10 @@ def list_agents():
 
 
 @app.get("/requests")
-def list_requests(limit: int = 200):
+def list_requests(limit: int = Query(200, ge=1, le=1000)):
+    # Bounded, because SQLite reads a negative LIMIT as "no limit": ?limit=-1
+    # used to return the entire table, and an unbounded one serialises it to
+    # JSON in memory. Same reasoning as the clamp on /audit/verify's anchors.
     return storage.get_requests(limit=limit)
 
 
@@ -367,7 +528,7 @@ def reset_audit_log():
 
 
 @app.get("/audit/events")
-def audit_events(limit: int = 100):
+def audit_events(limit: int = Query(100, ge=1, le=1000)):
     return storage.get_audit_events(limit=limit)
 
 
@@ -392,7 +553,7 @@ def audit_anchor():
 
 
 @app.get("/audit/anchors")
-def audit_anchors(limit: int = 20):
+def audit_anchors(limit: int = Query(20, ge=1, le=1000)):
     return storage.get_anchors(limit=limit)
 
 
@@ -626,14 +787,14 @@ def _execute_payment(agent_id: str, action: str, action_cfg: dict, reservation_i
     # runs sync handlers in a threadpool, so two concurrent /spend calls
     # for the same agent could clobber each other's token on a shared
     # mutable session header).
-    auth_headers = {policy_auth.HEADER_NAME: policy_auth.mint_token(agent_id, action)}
+    auth_headers = {policy_auth.HEADER_NAME: policy_auth.mint_token(agent_id, action, params)}
 
     try:
         # 60s, not 30s: the full round trip here is policy engine -> resource
         # server -> facilitator -> Algorand -> back, and the public testnet
         # facilitator/algod endpoints have been observed taking well over
         # 30s combined under real (if degraded) network conditions -- see
-        # README "Known limitations" #3. This doesn't make that dependency
+        # README "Known limitations" #4. This doesn't make that dependency
         # any less real, it just stops treating "slow" the same as "broken."
         response = session.get(url, headers=auth_headers, timeout=config.OUTBOUND_TIMEOUT_SECONDS)
     except Exception as e:
@@ -774,23 +935,7 @@ def spend(req: SpendRequest):
             "over_per_request_limit", params,
         )
 
-    # 8. Velocity. A daily cap bounds total damage but says nothing about
-    # rate: an agent stuck in a retry loop can burn a whole day's budget in
-    # seconds, and every one of those calls is individually within policy.
-    # This is the check that catches "correct but runaway", which is the
-    # failure mode an autonomous agent actually has.
-    rpm_limit = agent_cfg.get("max_requests_per_minute")
-    if rpm_limit is not None:
-        recent = storage.count_recent_requests(agent_id, VELOCITY_WINDOW_SECONDS)
-        if recent >= rpm_limit:
-            return _deny(
-                agent_id, action, amount_usd,
-                f"velocity limit hit: {recent} requests in the last {VELOCITY_WINDOW_SECONDS}s "
-                f"(max {rpm_limit}/min for '{agent_id}')",
-                "over_velocity_limit", params,
-            )
-
-    # 9. Human-in-the-loop threshold. Above this, policy alone isn't allowed
+    # 8. Human-in-the-loop threshold. Above this, policy alone isn't allowed
     # to authorize the spend -- it gets parked holding its budget until a
     # person releases or rejects it. Deliberately evaluated BEFORE the cap
     # reservation returns to the caller, so a parked request can't be
@@ -798,24 +943,42 @@ def spend(req: SpendRequest):
     approval_threshold = agent_cfg.get("require_approval_above_usd")
     needs_approval = approval_threshold is not None and amount_usd > approval_threshold
 
-    # 10. Daily cap -- atomically checked and reserved in one transaction, so
-    # two concurrent /spend calls for the same agent (double-click, two
-    # tabs, autoplay overlapping a manual fire) can't both read the same
-    # "spent so far" and both slip under the cap. See storage.try_reserve.
-    reservation = storage.try_reserve(
+    # 9 + 10. Velocity and the daily cap, decided together inside one
+    # BEGIN IMMEDIATE transaction (see storage.try_reserve).
+    #
+    # Velocity bounds the RATE: a daily cap bounds total damage but says
+    # nothing about how fast it arrives, and an agent stuck in a retry loop
+    # can burn a whole day's budget in seconds with every call individually
+    # within policy. That's the failure mode an autonomous agent actually
+    # has. The cap then bounds the day, atomically, so two concurrent calls
+    # (double-click, two tabs, autopilot overlapping a manual fire) can't
+    # both read the same "spent so far" and both slip under it.
+    #
+    # Both live in the same transaction because a rate limiter evaluated
+    # outside the write lock is a check-then-act -- and concurrency is
+    # precisely the condition it exists to survive.
+    reservation, rejected = storage.try_reserve(
         agent_id,
         action,
         amount_usd,
         agent_cfg["daily_cap_usd"],
         decision="awaiting_approval" if needs_approval else "pending",
         params=params,
+        max_requests_per_minute=agent_cfg.get("max_requests_per_minute"),
+        velocity_window_seconds=VELOCITY_WINDOW_SECONDS,
     )
-    if reservation is None:
-        spent_today = storage.get_daily_spend(agent_id, _today())
+    if rejected is not None:
+        if rejected["code"] == "over_velocity_limit":
+            return _deny(
+                agent_id, action, amount_usd,
+                f"velocity limit hit: {rejected['recent']} requests in the last "
+                f"{rejected['window_seconds']}s (max {rejected['limit']}/min for '{agent_id}')",
+                "over_velocity_limit", params,
+            )
         return _deny(
             agent_id, action, amount_usd,
-            f"${spent_today:.2f} spent today + ${amount_usd:.2f} would exceed "
-            f"daily cap ${agent_cfg['daily_cap_usd']:.2f} for '{agent_id}'",
+            f"${rejected['spent_today']:.2f} spent today + ${amount_usd:.2f} would exceed "
+            f"daily cap ${rejected['cap']:.2f} for '{agent_id}'",
             "over_daily_cap", params,
         )
 
@@ -849,20 +1012,46 @@ def approve_hold(request_id: int):
         raise HTTPException(409, f"request {request_id} is '{row['decision']}', not awaiting approval")
 
     policy = policy_store.get_policy()
+
+    # Re-run the authority checks at RELEASE time, not just at request time.
+    # A hold sits for as long as the reviewer takes, and everything policy
+    # says about this agent can change while it waits. The reviewer is
+    # approving an amount; they are not re-granting the permission to make
+    # the call at all -- so a hold must not become a hole through which a
+    # revocation that landed in the meantime is escaped.
+    #
+    # Each of these is a way an operator can say "this agent may no longer
+    # do this", and every one of them has to reach a queued request:
+    reason = None
+    agent_cfg = policy["agents"].get(row["agent_id"])
     action_cfg = policy["actions"].get(row["action"])
+
     if action_cfg is None:
         reason = f"action '{row['action']}' no longer exists in policy"
-        return {"decision": "denied", "reason": reason, "log": storage.finalize(request_id, "denied", reason)}
-
-    # Re-check the kill switch at release time, not just at request time. A
-    # hold can sit for as long as the reviewer takes, and an agent frozen
-    # in the meantime must not be able to spend through a request that was
-    # already in the queue when the freeze landed.
-    agent_cfg = policy["agents"].get(row["agent_id"], {})
-    if agent_cfg.get("frozen"):
+    elif agent_cfg is None:
+        # Deregistration. The kill switch stops an agent; deregistering it
+        # removes it outright, which is strictly the stronger statement --
+        # it would be absurd for the weaker one to block a queued spend and
+        # the stronger one to let it through.
+        reason = (
+            f"agent '{row['agent_id']}' was deregistered while this request was awaiting approval"
+        )
+    elif agent_cfg.get("frozen"):
         reason = f"agent '{row['agent_id']}' was frozen while this request was awaiting approval"
+    elif row["action"] not in agent_cfg["allowed_actions"]:
+        reason = (
+            f"agent '{row['agent_id']}' is no longer approved for '{row['action']}' "
+            "-- the action was revoked while this request was awaiting approval"
+        )
+
+    if reason is not None:
         storage.append_event("approval.blocked", {"request_id": request_id, "reason": reason})
-        return {"decision": "denied", "reason": reason, "log": storage.finalize(request_id, "denied", reason)}
+        return {
+            "decision": "denied",
+            "reason": reason,
+            "code": "approval_blocked",
+            "log": storage.finalize(request_id, "denied", reason),
+        }
 
     # The arguments this hold was created with, not a fresh resolution. A
     # reviewer approved a specific call -- "enrich Apple Inc." -- and if

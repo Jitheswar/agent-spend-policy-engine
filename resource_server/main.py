@@ -42,7 +42,6 @@ from starlette.responses import JSONResponse
 from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
 from x402.http.types import RouteConfig
-from x402.mechanisms.avm import ALGORAND_TESTNET_CAIP2  # noqa: F401  (kept for doc/reference)
 from x402.mechanisms.avm.exact import ExactAvmServerScheme
 from x402.schemas import AssetAmount
 from x402.server import x402ResourceServer
@@ -117,12 +116,12 @@ class PolicyAuthMiddleware(BaseHTTPMiddleware):
     token from the policy engine, before the x402 middleware ever runs.
 
     Starlette runs middleware added via add_middleware() in LAST-added,
-    first-executed order on incoming requests (verified empirically against
-    this installed version -- see scratch/middleware_order_test.py from the
-    session that added this). Registering this middleware AFTER
-    PaymentMiddlewareASGI above is what makes it the outer layer: an
+    first-executed order on incoming requests. Registering this middleware
+    AFTER PaymentMiddlewareASGI above is what makes it the outer layer: an
     unauthorized caller gets a 403 here and never even sees a 402, let
-    alone gets a chance to pay.
+    alone gets a chance to pay. The ordering is asserted rather than
+    assumed -- tests/test_upstreams.py drives the real installed middleware
+    stack, so a dependency upgrade that reversed it would fail the suite.
     """
 
     async def dispatch(self, request, call_next):
@@ -140,7 +139,11 @@ class PolicyAuthMiddleware(BaseHTTPMiddleware):
                 status_code=403,
             )
 
-        ok, reason, _claimed_agent_id = verify_token(token, action)
+        # The token commits to the arguments the engine approved, so they
+        # are checked against the ones actually on the wire. Without this,
+        # a token good for "enrich Apple Inc." would serve any company for
+        # its whole lifetime.
+        ok, reason, _claimed_agent_id = verify_token(token, action, dict(request.query_params))
         if not ok:
             return JSONResponse({"error": "invalid policy authorization", "detail": reason}, status_code=403)
 

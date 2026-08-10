@@ -136,3 +136,64 @@ def test_generated_key_matches_the_address_it_claims(temp_accounts):
     sk_bytes = base64.b64decode(stored["avm_private_key_b64"])
     assert algosdk.encoding.encode_address(sk_bytes[32:]) == address
     assert algosdk.account.address_from_private_key(stored["avm_private_key_b64"]) == address
+
+
+# ---------------------------------------------------------------------------
+# Editing an agent is held to the same rules as creating one
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def edit_client(temp_policy, monkeypatch):
+    """A client whose policy edits land in the temp file above, never in the
+    committed policy.json."""
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    os.remove(db_path)
+
+    from fastapi.testclient import TestClient
+
+    from policy_engine import app as app_module
+    from policy_engine import storage
+
+    monkeypatch.setattr(storage, "DB_PATH", db_path)
+    storage.init_db()
+    yield TestClient(app_module.app)
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+
+def test_patch_refuses_an_action_nobody_defined(edit_client):
+    """POST /admin/agents validated allowed_actions and PATCH didn't, which
+    let an arbitrary caller-chosen string be written straight into
+    policy.json -- and from there into the dashboard's markup. It is also
+    just wrong on its own terms: it grants an authority that cannot be
+    exercised, and reads in the audit log as though it could.
+    """
+    response = edit_client.patch(
+        "/admin/agents/agent_weather", json={"allowed_actions": ["weather", "teleport"]}
+    )
+
+    assert response.status_code == 400
+    assert "teleport" in response.json()["detail"]
+    # And the refusal is total -- no partial write of the valid half.
+    assert policy_store.get_policy()["agents"]["agent_weather"]["allowed_actions"] == ["weather"]
+
+
+def test_patch_refuses_markup_smuggled_through_an_action_name(edit_client):
+    evil = 'x" onfocus="alert(1)" autofocus="'
+    assert edit_client.patch(
+        "/admin/agents/agent_weather", json={"allowed_actions": [evil]}
+    ).status_code == 400
+
+
+def test_patch_still_accepts_a_real_action(edit_client):
+    response = edit_client.patch("/admin/agents/agent_weather", json={"allowed_actions": []})
+    assert response.status_code == 200
+    assert response.json()["allowed_actions"] == []
+
+    response = edit_client.patch(
+        "/admin/agents/agent_weather", json={"allowed_actions": ["weather"]}
+    )
+    assert response.status_code == 200
+    assert policy_store.get_policy()["agents"]["agent_weather"]["allowed_actions"] == ["weather"]

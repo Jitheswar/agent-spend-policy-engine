@@ -37,7 +37,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from common import config
 
@@ -138,6 +138,65 @@ def init_db() -> None:
             existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
             if column not in existing:
                 conn.execute(ddl)
+    reap_stale_reservations()
+
+
+def reap_stale_reservations(older_than_seconds: int | None = None) -> list[int]:
+    """Resolve 'pending' reservations that no live request can still finalize.
+
+    A reservation holds budget from the moment it's written until something
+    finalizes it, and every code path in policy_engine/app.py does finalize
+    -- but a SIGKILL, an OOM, or a power cut is not a code path. The row
+    survives in 'pending', keeps counting toward the daily cap (see
+    CAP_COUNTING_DECISIONS), and nothing ever clears it: an agent could come
+    back from a crash with part of its budget permanently spoken for by a
+    payment that never happened, and the only cure was wiping the
+    operational log.
+
+    So this runs at startup. Anything older than the outbound timeout cannot
+    still be in flight -- that timeout is the longest a /spend call can
+    possibly be waiting on the resource server -- so it's resolved to
+    'denied', which releases the budget.
+
+    Deliberately an audit event rather than a silent repair. "This spend was
+    abandoned when the engine restarted" is a real thing that happened to a
+    real reservation, and a ledger that quietly omits it is a ledger with a
+    gap exactly where an operator would go looking.
+    """
+    if older_than_seconds is None:
+        older_than_seconds = config.OUTBOUND_TIMEOUT_SECONDS
+    cutoff = _window_cutoff(_now(), older_than_seconds)
+
+    reaped: list[int] = []
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM requests WHERE decision = 'pending' AND timestamp <= ?", (cutoff,)
+        ).fetchall()
+        for row in rows:
+            reason = (
+                "abandoned: the policy engine restarted while this payment was in flight, "
+                "so its reservation was released"
+            )
+            conn.execute(
+                "UPDATE requests SET decision = 'denied', reason = ? WHERE id = ?",
+                (reason, row["id"]),
+            )
+            _append_event_locked(
+                conn,
+                "request.decided",
+                {
+                    "request_id": row["id"],
+                    "agent_id": row["agent_id"],
+                    "action": row["action"],
+                    "amount_usd": row["amount_usd"],
+                    "params": json.loads(row["params"] or "{}"),
+                    "decision": "denied",
+                    "reason": reason,
+                    "tx_id": None,
+                },
+            )
+            reaped.append(row["id"])
+    return reaped
 
 
 def _now() -> str:
@@ -434,14 +493,30 @@ def try_reserve(
     daily_cap_usd: float,
     decision: str = "pending",
     params: dict | None = None,
-) -> dict | None:
-    """Atomically checks the daily cap and reserves amount_usd against it.
+    max_requests_per_minute: int | None = None,
+    velocity_window_seconds: int = 60,
+) -> tuple[dict | None, dict | None]:
+    """Atomically checks the rate limit and the daily cap, then reserves
+    amount_usd against the cap.
 
-    Runs the read (sum of today's cap-counting spend) and the insert of the
-    reservation row in a single BEGIN IMMEDIATE transaction, so a second
-    concurrent call for the same agent can't read the same "spent so far"
-    before this one commits -- it blocks (up to the connection timeout) and
-    then sees this reservation's amount already counted.
+    Returns (row, rejection). Exactly one is None. `rejection` carries the
+    code and the numbers the caller needs to write an accurate denial
+    message, so nothing downstream has to re-query for them -- re-reading
+    after the transaction closed would report a count that had already moved.
+
+    Runs the reads (requests in the window, sum of today's cap-counting
+    spend) and the insert of the reservation row in a single BEGIN IMMEDIATE
+    transaction, so a second concurrent call for the same agent can't read
+    the same "spent so far" before this one commits -- it blocks (up to the
+    connection timeout) and then sees this reservation's amount already
+    counted.
+
+    The velocity check lives in here for exactly the same reason the cap
+    does, and it did not always: it used to run in the policy engine as a
+    separate count-then-act, which meant the cap was race-free and the rate
+    limit -- the control specifically built to stop a runaway loop, i.e. the
+    most concurrent thing an agent does -- was not. Two simultaneous
+    requests could both read a count below the limit and both proceed.
 
     The UTC day is derived from the timestamp this function is about to
     write, NOT passed in by the caller. Those have to be the same value or
@@ -454,10 +529,6 @@ def try_reserve(
     `decision` is the state the reservation starts in: 'pending' for a spend
     about to be paid, 'awaiting_approval' for one parked for a human. Both
     hold budget; see CAP_COUNTING_DECISIONS.
-
-    Returns the inserted row, or None if reserving would exceed the cap
-    (transaction rolled back, nothing written -- caller should log the
-    denial itself via log_request).
     """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -467,6 +538,28 @@ def try_reserve(
         conn.execute("BEGIN IMMEDIATE")
         ts = _now()
         day = ts[:10]
+
+        # Velocity first, so its denial wins when a request trips both. That
+        # ordering is the informative one: "you are going too fast" tells an
+        # operator to look at a retry loop, where "you are out of budget"
+        # sends them to look at a cap that is working exactly as intended.
+        if max_requests_per_minute is not None:
+            cutoff = _window_cutoff(ts, velocity_window_seconds)
+            recent = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM requests WHERE agent_id = ? AND timestamp > ?",
+                    (agent_id, cutoff),
+                ).fetchone()["n"]
+            )
+            if recent >= max_requests_per_minute:
+                conn.execute("ROLLBACK")
+                return None, {
+                    "code": "over_velocity_limit",
+                    "recent": recent,
+                    "limit": max_requests_per_minute,
+                    "window_seconds": velocity_window_seconds,
+                }
+
         placeholders = ",".join("?" * len(CAP_COUNTING_DECISIONS))
         row = conn.execute(
             f"SELECT COALESCE(SUM(amount_usd), 0) AS total FROM requests "
@@ -479,7 +572,7 @@ def try_reserve(
         # up to a cap is rejected roughly whenever the rounding lands high.
         if spent + amount_usd > daily_cap_usd + 1e-9:
             conn.execute("ROLLBACK")
-            return None
+            return None, {"code": "over_daily_cap", "spent_today": spent, "cap": daily_cap_usd}
 
         reason = (
             "reserved, awaiting payment settlement"
@@ -506,7 +599,7 @@ def try_reserve(
         )
         result = dict(conn.execute("SELECT * FROM requests WHERE id = ?", (row_id,)).fetchone())
         conn.execute("COMMIT")
-        return result
+        return result, None
     finally:
         conn.close()
 
@@ -587,18 +680,33 @@ def get_daily_spend(agent_id: str, day: str) -> float:
         return float(row["total"])
 
 
+def _window_cutoff(now_iso: str, window_seconds: int) -> str:
+    """The timestamp a row must be newer than to fall inside the window.
+
+    Derived from the caller's own `now` rather than a fresh clock read, so
+    the reservation being written and the window it's checked against agree
+    exactly -- see try_reserve, which passes the same timestamp it stamps
+    the row with.
+    """
+    now = datetime.fromisoformat(now_iso)
+    return (now - timedelta(seconds=window_seconds)).isoformat()
+
+
 def count_recent_requests(agent_id: str, window_seconds: int) -> int:
     """How many requests this agent has made in the last `window_seconds`,
     counting every decision -- the point of a velocity limit is to catch a
     runaway loop, and a loop that's being denied every time is still a
     runaway loop worth stopping.
+
+    Read-only, for display (GET /agents shows it on each card). ENFORCEMENT
+    does not go through here: it happens inside try_reserve's transaction,
+    because a count read outside the write lock is a check-then-act on the
+    one control whose whole job is to survive concurrency.
     """
-    cutoff = datetime.now(timezone.utc).timestamp() - window_seconds
-    cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
     with _connect() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS n FROM requests WHERE agent_id = ? AND timestamp > ?",
-            (agent_id, cutoff_iso),
+            (agent_id, _window_cutoff(_now(), window_seconds)),
         ).fetchone()
         return int(row["n"])
 

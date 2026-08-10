@@ -40,6 +40,7 @@ def reload_config(monkeypatch, env: dict, dotenv_path: str | None = None):
             "USDC_ASA_ID", "EXPLORER_TX_URL", "FACILITATOR_URL", "DASHBOARD_PORT",
             "DASHBOARD_ORIGINS", "AUTO_ANCHOR_THRESHOLD", "ASPE_DISABLE_ANCHOR",
             "SEC_USER_AGENT", "DATA_DIR", "ACCOUNTS_PATH",
+            "ADMIN_TOKEN", "ADMIN_TOKEN_PATH", "ALLOW_DEMO_ENDPOINTS",
         }:
             monkeypatch.delenv(key, raising=False)
     for key, value in env.items():
@@ -196,14 +197,67 @@ def test_explorer_url_returns_nothing_for_no_transaction():
 
 
 def test_mainnet_refuses_to_start_without_an_explicit_opt_in(monkeypatch):
-    """Real funds plus unauthenticated /admin routes shouldn't be reachable
-    by a typo in a config file."""
+    """Real funds shouldn't be reachable by a typo in a config file."""
     with pytest.raises(SystemExit) as excinfo:
         reload_config(monkeypatch, {"NETWORK": "mainnet"})
 
     message = str(excinfo.value)
     assert "ALLOW_MAINNET" in message
     assert "real funds" in message.lower()
+
+
+def test_mainnet_refuses_to_run_the_admin_plane_unauthenticated(monkeypatch):
+    """An empty ADMIN_TOKEN is a legitimate setting -- it means "no auth on
+    /admin", which is defensible on a throwaway testnet box. Combined with
+    real funds it means anyone who can reach the port controls the kill
+    switch and the approval queue, so the two settings are refused together
+    rather than left to be discovered."""
+    with pytest.raises(SystemExit) as excinfo:
+        reload_config(
+            monkeypatch, {"NETWORK": "mainnet", "ALLOW_MAINNET": "true", "ADMIN_TOKEN": ""}
+        )
+
+    assert "ADMIN_TOKEN" in str(excinfo.value)
+
+
+def test_demo_endpoints_default_off_on_mainnet(monkeypatch):
+    """/admin/sign signs as any agent. Leaving it on where funds are real
+    would make the identity guarantee decorative for anyone holding the
+    admin token, so mainnet has to opt into it separately."""
+    testnet = reload_config(monkeypatch, {"NETWORK": "testnet"})
+    assert testnet.ALLOW_DEMO_ENDPOINTS is True
+
+    mainnet = reload_config(
+        monkeypatch, {"NETWORK": "mainnet", "ALLOW_MAINNET": "true", "ADMIN_TOKEN": "s3cret"}
+    )
+    assert mainnet.ALLOW_DEMO_ENDPOINTS is False
+
+
+def test_an_admin_token_is_generated_and_reused(monkeypatch, tmp_path):
+    """A security control that ships off because switching it on is a chore
+    is a security control nobody has. With nothing configured, one is minted
+    and persisted -- and the same one comes back next time, so a restart
+    doesn't invalidate the dashboard's copy mid-demo."""
+    token_path = tmp_path / "admin_token.txt"
+    module = reload_config(monkeypatch, {"ADMIN_TOKEN_PATH": str(token_path)})
+
+    first = module.admin_token()
+    assert first and len(first) >= 32
+    assert module.admin_auth_enabled() is True
+
+    module._admin_token_cache = None  # force a re-read from disk
+    assert module.admin_token() == first
+    assert token_path.read_text().strip() == first
+
+
+def test_importing_config_does_not_mint_a_token(monkeypatch, tmp_path):
+    """Resolved lazily on purpose: importing a config module must not have
+    the side effect of writing a file, or `python3 -m common.config` and
+    every test reload would scatter secrets around."""
+    token_path = tmp_path / "admin_token.txt"
+    reload_config(monkeypatch, {"ADMIN_TOKEN_PATH": str(token_path)})
+
+    assert not token_path.exists()
 
 
 def test_the_guard_holds_in_a_fresh_interpreter():
@@ -254,16 +308,28 @@ def test_no_module_carries_its_own_copy_of_a_network_constant():
 
 
 def test_env_example_documents_every_knob():
-    """A knob nobody can discover is a knob nobody uses. Every variable the
-    config module reads should appear in the committed example file."""
-    example = open(os.path.join(ROOT, ".env.example")).read()
-    source = open(config.__file__).read()
+    """A knob nobody can discover is a knob nobody uses.
 
-    referenced = set()
-    for line in source.splitlines():
-        for marker in ('env("', 'env_bool("'):
-            if marker in line:
-                referenced.add(line.split(marker, 1)[1].split('"', 1)[0])
+    Scans the WHOLE repository, not just common/config.py. It used to scan
+    only that one module, which meant a `config.env("…")` call anywhere else
+    was undocumented and undetected -- scripts/phase1_client.py had two of
+    them. The guarantee this test is cited for is "every setting is written
+    down", and that has to mean every setting.
+    """
+    example = open(os.path.join(ROOT, ".env.example")).read()
+
+    referenced: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [
+            d for d in dirnames if d not in {".venv", ".git", "__pycache__", ".pytest_cache", "tests"}
+        ]
+        for name in filenames:
+            if not name.endswith(".py"):
+                continue
+            for line in open(os.path.join(dirpath, name)).read().splitlines():
+                for marker in ('env("', 'env_bool("'):
+                    if marker in line and "def " not in line:
+                        referenced.add(line.split(marker, 1)[1].split('"', 1)[0])
 
     missing = sorted(name for name in referenced if name not in example)
     assert not missing, f"undocumented in .env.example: {', '.join(missing)}"

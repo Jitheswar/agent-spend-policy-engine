@@ -115,7 +115,10 @@ x402 pattern (stable pricing per call).
   check chain above and only then calls the x402 payment loop. A denial
   never reaches the resource server, so no payment is ever attempted for a
   blocked request. `policy_store.py` hot-reloads `policy.json` on mtime
-  change and persists live edits back to it atomically.
+  change and persists live edits back to it atomically. Every `/admin/*`
+  route is gated by `AdminAuthMiddleware` — a middleware rather than a
+  per-route dependency, because a dependency you forget to attach fails
+  open.
 - **`policy_engine/storage.py`** — two tables, two jobs. `requests` is the
   mutable operational view the dashboard reads. `audit_events` is the
   append-only hash-chained ledger; nothing in the codebase updates or
@@ -142,7 +145,13 @@ x402 pattern (stable pricing per call).
   domain-separated from transaction signing. Replay-guarded (nonce + 60s
   window).
 - **`common/policy_auth.py`** — the shared-secret HMAC token the engine
-  mints per approved spend and the resource server verifies.
+  mints per approved spend and the resource server verifies. It commits to
+  the agent and the call arguments, not just the action, so it authorizes
+  one specific call rather than a category of them.
+- **`common/algod.py`** — the one place an algod client gets built. There
+  were four, three of which passed an empty auth token, so `ALGOD_TOKEN`
+  was resolved, documented, and then ignored by everything except account
+  setup.
 - **`agents/simulate.py`** — fires curated, repeatable sequences of
   *signed* requests, using key material it has legitimate local access to.
 - **`common/provisioning.py`** — onboards a new agent at runtime: keypair,
@@ -167,16 +176,26 @@ is evaluated, and the kill switch is checked before every budget rule.
 | **Call arguments** | `invalid_params` | Bound *what* it may ask for, not just what it may spend |
 | Per-request limit | `over_per_request_limit` | Bound any single call |
 | **Velocity** | `over_velocity_limit` | Bound the *rate*. A daily cap doesn't stop a retry loop burning it in seconds |
-| Daily cap | `over_daily_cap` | Bound the day. Atomically reserved, so concurrent calls can't both slip under |
+| Daily cap | `over_daily_cap` | Bound the day |
 | **Human approval threshold** | `awaiting_approval` | Above this, policy alone can't authorize — a person must release it |
 
-The last one parks the request holding its budget, so a queued approval
-can't be double-spent against while it waits. Freezing an agent while a
-hold is queued blocks the release too — otherwise the kill switch would
-have a queue-shaped hole in it. Releasing a hold pays for the call as
-originally requested, arguments included, so a policy edit landing while it
-sat in the queue can't spend a reviewer's approval on a different call than
-the one they saw.
+Velocity and the daily cap are decided **in one transaction**, which is what
+makes both race-free: two concurrent calls for the same agent can't read the
+same "spent so far", or the same request count, and both slip under. The
+rate limiter especially — it exists to stop a runaway loop, which is the
+most concurrent thing an agent ever does, so a limiter with a window
+between reading the count and writing the row is a limiter that fails at
+exactly its own job.
+
+The last check parks the request holding its budget, so a queued approval
+can't be double-spent against while it waits. Releasing a hold re-runs
+every authority check at release time: an agent frozen, deregistered, or
+stripped of the action while its request sat in the queue does not get to
+spend through it. A reviewer is approving an *amount*; they are not
+re-granting a permission somebody else revoked. And the hold pays for the
+call as originally requested, arguments included, so a policy edit landing
+mid-queue can't spend a reviewer's approval on a different call than the
+one they saw.
 
 Per-agent config lives in `policy_engine/policy.json` and is editable live
 (`PATCH /admin/agents/{id}`, or just edit the file — it hot-reloads).
@@ -282,10 +301,34 @@ anything spends — the expensive mistake here isn't a setting you can't find,
 it's one you never thought to check.
 
 `NETWORK=mainnet` refuses to start unless `ALLOW_MAINNET=true` is set
-alongside it. Real funds plus unauthenticated `/admin` routes (limitation #8
-below) shouldn't be reachable by a typo. Localnet isn't offered: settlement
-goes through a public x402 facilitator, which can't reach a chain on your
-laptop.
+alongside it — real funds shouldn't be reachable by a typo. It also refuses
+to run with `ADMIN_TOKEN` explicitly empty, and turns `ALLOW_DEMO_ENDPOINTS`
+off by default: an unauthenticated kill switch, or a signing oracle, next to
+money that's worth something is a combination worth making unrepresentable
+rather than merely discouraged. Localnet isn't offered: settlement goes
+through a public x402 facilitator, which can't reach a chain on your laptop.
+
+### The admin plane
+
+Every `/admin/*` route is an authority over money — freeze, unfreeze,
+onboard, release a held spend, edit a cap — so all of them require a bearer
+token:
+
+```bash
+curl -H "Authorization: Bearer $(python3 -m common.config --admin-token)" \
+     -X POST http://127.0.0.1:4022/admin/agents/agent_rogue/freeze \
+     -H 'Content-Type: application/json' -d '{"frozen":true}'
+```
+
+One is generated on first run into `data/admin_token.txt` (gitignored) and
+written into `dashboard/config.js` by `start.sh`, so nothing needs
+configuring for the demo. Set `ADMIN_TOKEN` in the environment to use your
+own. Set it to an empty string to turn authentication off entirely — a
+defensible choice on a throwaway testnet box, and refused on mainnet.
+
+`/spend` is deliberately **not** behind this. Anyone may attempt a spend;
+the signature decides whether it succeeds. Replacing a cryptographic
+identity check with a shared secret would be strictly weaker.
 
 Every knob is listed with its default in [`.env.example`](.env.example);
 a test asserts nothing the config module reads is missing from it.
@@ -376,7 +419,9 @@ demo, and a worse system, than one that says what it's doing.
 Same thing from the CLI:
 
 ```bash
-curl -X POST http://127.0.0.1:4022/admin/agents -H 'Content-Type: application/json' \
+curl -X POST http://127.0.0.1:4022/admin/agents \
+  -H "Authorization: Bearer $(python3 -m common.config --admin-token)" \
+  -H 'Content-Type: application/json' \
   -d '{"agent_id":"agent_research","display_name":"Research Agent",
        "allowed_actions":["weather"],"per_request_limit_usd":0.02,"daily_cap_usd":0.10}'
 ```
@@ -407,27 +452,36 @@ python3 scripts/setup_accounts.py balances
 pytest tests/ -v
 ```
 
-127 tests, no network required — the upstreams are mocked and anchoring is
+183 tests, no network required — the upstreams are mocked and anchoring is
 disabled process-wide in `tests/conftest.py`, so a unit-test run never
-submits a transaction or calls a vendor.
+submits a transaction or calls a vendor. Admin auth is also off there, so
+the suite can drive `/admin` routes directly; `test_admin_auth.py` switches
+it on and tests enforcement for real.
 
-- `test_policy_engine.py` — policy decisions, the daily-cap concurrency fix
-  (12 simultaneous reservations against a cap with room for 2, asserts
-  exactly 2 succeed), reservation-leak handling, and signed-identity denial
-  paths at the HTTP layer.
+- `test_policy_engine.py` — policy decisions, the two concurrency fixes (12
+  simultaneous reservations against a cap with room for 2, and 12 against a
+  rate limit of 3, asserting exactly 2 and exactly 3 get through),
+  reservation-leak handling including the startup sweep, and signed-identity
+  denial paths at the HTTP layer.
+- `test_admin_auth.py` — every `/admin` route refuses an unauthenticated
+  caller and accepts the right token, parameterised over the route table so
+  a new route can't quietly ship without a lock; `/spend` and the read-only
+  views stay open; the demo endpoints vanish (404, not 403) when disabled.
 - `test_audit_ledger.py` — the hash chain accepts an honest ledger and
   rejects a doctored one, including the *competent* tamper where the
   attacker recomputes the edited entry's own hash. Also covers the case
   that justifies anchoring at all: a fully-rewritten chain that verifies
   locally and still fails against its anchor.
 - `test_governance.py` — kill switch, velocity limiting, approval holds
-  (budget held while queued, freed on reject, blocked if the agent is
-  frozen mid-queue, not approvable twice).
+  (budget held while queued, freed on reject, not approvable twice) and the
+  three ways an authority can be revoked mid-queue — frozen, deregistered,
+  action taken away — each of which must reach the queued request.
 - `test_identity.py` — request signing/verification: wrong-key
   impersonation, tampered amount/action, expired timestamp, replay,
   malformed signature.
-- `test_policy_auth.py` — resource-server token: wrong action, tampered
-  signature, expired, malformed.
+- `test_policy_auth.py` — resource-server token: wrong action, wrong call
+  arguments, tampered signature, expired, malformed, and that its TTL still
+  covers the engine's configurable outbound budget.
 - `test_policy_store.py` — hot-reload on file edit, live `PATCH` persists.
 - `test_config.py` — `.env` parsing and precedence, both network profiles
   resolving consistently against the payment library's own config, the
@@ -441,8 +495,14 @@ submits a transaction or calls a vendor.
   >= 400 is never settled, while a 200 still is.
 - `test_params.py` — schema enforcement, defaults, params covered by the
   signature (swapping them in flight fails identity), the arguments
-  surviving an approval hold across a policy edit, and the SQLite migration
-  that adds the column to a database created before it existed.
+  surviving an approval hold across a policy edit, the SQLite migration
+  that adds the column to a database created before it existed, and the
+  hard ceilings that stop an unauthenticated caller writing an arbitrary
+  blob into a ledger with no delete path.
+- `test_agent_onboarding.py` — a new agent is governed from the moment it
+  exists, can't clobber an existing one, and can't be given an action
+  nobody defined — through `PATCH` as well as `POST`, which is where that
+  check was missing.
 
 Doesn't cover the approval path end-to-end (that needs a live facilitator +
 funded testnet accounts — see `scripts/phase1_client.py` for that proof).
@@ -458,14 +518,19 @@ without a valid, unexpired HMAC token minted by the policy engine after a
 spend clears. Verified live: a direct `curl` with no token gets 403 before
 ever seeing a 402; a tampered or wrong-action token gets 403; the real flow
 still works (the header survives the x402 client's internal 402-retry).
+The token commits to the agent **and to the call arguments**, so one minted
+for "enrich Apple Inc." can't be used to enrich anything else.
 **Scope:** this is a shared static secret on local disk, not network
 isolation. Production would put the resource server on a network only the
 engine can reach, or use mTLS. It closes "pay the resource server directly
 with your own funded wallet", not every bypass available to an attacker
-with filesystem access.
+with filesystem access. It is also not single-use: the x402 flow issues the
+request twice (once to draw the 402, once carrying the payment) and the
+same token has to satisfy both, so the bound is the TTL — one round trip,
+not a session.
 
 **2. Agent identity wasn't cryptographically verified.** Mostly fixed.
-`/spend` requires a signature over `(agent_id, action, amount_usd,
+`/spend` requires a signature over `(agent_id, action, amount_usd, params,
 timestamp, nonce)`, verified with `algosdk.util.verify_bytes` against the
 agent's known address. Replay-guarded and TTL-bounded.
 **Scope:** in this demo the engine already holds every agent's key
@@ -473,11 +538,17 @@ custodially (that's how it signs their payments), so there's no separate
 process holding a key nobody else touches. `agents/simulate.py` signs for
 real with key material it legitimately has, like a genuine agent would. The
 dashboard's Fire buttons are a human operator, not a cryptographic
-identity, so they go through `POST /admin/sign` — a clearly-labeled
-convenience endpoint, explicitly not something a real agent would call.
-What this proves: `/spend` rejects any caller who doesn't possess an
-agent's private key. What it doesn't: that the dashboard operator *is* the
-agent — it isn't, and doesn't claim to be.
+identity, so they go through `POST /admin/sign`.
+
+Be exact about that endpoint, because the guarantee turns on it: **it is a
+signing oracle.** It will sign for any agent. So the honest claim is
+conditional, and the condition is now enforced rather than assumed —
+`/admin/sign` sits behind the admin bearer token *and* behind
+`ALLOW_DEMO_ENDPOINTS`, which defaults off on mainnet. With it disabled,
+`/spend` rejects any caller who doesn't possess an agent's private key,
+full stop. With it enabled, that holds for every caller who doesn't also
+hold the admin token. What it never claims: that the dashboard operator
+*is* the agent — it isn't, and doesn't pretend to be.
 
 **3. A hash chain cannot detect an edit to its own last entry.** Inherent,
 not a bug, and worth stating rather than glossing. Nothing follows the head
@@ -538,13 +609,34 @@ waiting on a facilitator — the upstream timeout is capped at 10s against the
 engine's 60s outbound budget specifically so a slow vendor can't starve the
 payment leg and surface as a payment failure.
 
-**8. The admin plane still has no authentication.** Not fixed, and the
-largest remaining hole. Every `/admin/*` route — freeze, unfreeze, onboard,
-approve a held spend, edit a cap — is reachable by anything that can open a
-socket to `:4022`. For a system whose whole product is "a person controls
-what the agents do," the kill switch having no lock on it is the gap to
-close next. `/admin/demo/tamper` and `/admin/sign` also ship enabled and
-should be behind an explicit flag.
+**8. The admin plane had no authentication.** Fixed. Every `/admin/*`
+route — freeze, unfreeze, onboard, approve a held spend, edit a cap — now
+requires `Authorization: Bearer <ADMIN_TOKEN>`. A token is generated on
+first run into `data/admin_token.txt` and handed to the dashboard by
+`start.sh`, so the demo needs no setup; `ADMIN_TOKEN` in the environment
+overrides it. Setting it explicitly empty disables auth, which is a real
+option for a throwaway testnet box and is refused outright on mainnet.
+`/admin/sign` and `/admin/demo/*` sit behind a second flag,
+`ALLOW_DEMO_ENDPOINTS`, defaulting on for testnet and off for mainnet.
+**Scope:** a bearer token shared with a local page, not per-operator
+identity. It closes "anything that can open a socket to `:4022` owns the
+kill switch"; it does not tell two operators apart, and it is not an
+authorization model. Both would be real work, and neither is pretended at.
+
+**9. A hold could outlive the authority that created it.** Fixed. Releasing
+a spend parked for approval re-checks, at release time, that the agent still
+exists, isn't frozen, and is still allowed the action. Freezing was already
+handled; deregistering the agent and revoking the action were not, so both
+let a queued spend through — a reviewer approving an amount was
+inadvertently re-granting a permission that had been taken away while the
+request sat in the queue.
+
+**10. Reservations could leak on a crash.** Fixed. A reservation holds
+budget until something finalizes it, and every code path does — but a
+SIGKILL is not a code path, and the row went on counting against the daily
+cap forever. The engine now sweeps reservations older than the outbound
+timeout at startup, releases them, and records the release in the ledger
+rather than repairing it silently.
 
 ## Verifying it's real
 

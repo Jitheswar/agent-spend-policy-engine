@@ -137,18 +137,37 @@ _PROFILE = get_network_config(CAIP2)
 
 IS_MAINNET = NETWORK == "mainnet"
 
-# Real money, and this system still has no authentication on its admin
-# routes (README "Known limitations" #8) -- anything that can reach the
-# policy engine's port can unfreeze an agent or release a held spend. That
-# combination shouldn't be reachable by a typo in a config file, so mainnet
-# takes a second, explicit opt-in.
+# Real money. Mainnet takes a second, explicit opt-in so it isn't reachable
+# by a typo in a config file.
 if IS_MAINNET and not env_bool("ALLOW_MAINNET"):
     raise SystemExit(
-        "NETWORK=mainnet moves real funds, and this system has no auth on its\n"
-        "/admin routes -- anyone who can reach its port can release a held\n"
-        "spend or unfreeze an agent. If you have read that and still mean it,\n"
-        "set ALLOW_MAINNET=true alongside it."
+        "NETWORK=mainnet moves real funds. Every /admin route -- freeze,\n"
+        "unfreeze, onboard, release a held spend, edit a cap -- is a control\n"
+        "over money that is worth something. If you have read that and still\n"
+        "mean it, set ALLOW_MAINNET=true alongside it."
     )
+
+# `None` means "no ADMIN_TOKEN was set, mint one and persist it" (see
+# admin_token()). An explicitly EMPTY value means "run the admin plane with
+# no authentication at all" -- which is a legitimate thing to want on a
+# throwaway testnet box, and an indefensible thing to want anywhere real.
+_ADMIN_TOKEN_ENV = env("ADMIN_TOKEN")
+
+if IS_MAINNET and _ADMIN_TOKEN_ENV == "":
+    raise SystemExit(
+        "ADMIN_TOKEN is explicitly empty, which disables authentication on\n"
+        "every /admin route -- the kill switch, the approval queue, the caps.\n"
+        "That cannot be combined with NETWORK=mainnet. Unset ADMIN_TOKEN to\n"
+        "have one generated, or set it to a secret you control."
+    )
+
+# The demo-only endpoints: POST /admin/sign (signs a /spend request on any
+# agent's behalf) and POST /admin/demo/* (doctors and restores audit
+# records). They exist to make the system demonstrable, and /admin/sign in
+# particular is a signing oracle -- with it enabled, "only a caller holding
+# an agent's private key can spend" is true only of callers who also lack
+# the admin token. Default on for testnet, off for mainnet.
+ALLOW_DEMO_ENDPOINTS = env_bool("ALLOW_DEMO_ENDPOINTS", not IS_MAINNET)
 
 ALGOD_URL = env("ALGOD_URL", _PROFILE["algod_url"])
 INDEXER_URL = env("INDEXER_URL", _PROFILE["indexer_url"])
@@ -194,6 +213,11 @@ DASHBOARD_ORIGINS = [
 # How long the engine waits on the resource server. Covers the upstream
 # fetch AND the facilitator round trip, so it's generous by design; see the
 # note on UPSTREAM_TIMEOUT_SECONDS in resource_server/upstreams.py.
+#
+# Two other things are derived from it, so raising it moves them too:
+# policy_auth.TOKEN_TTL_SECONDS (a token has to outlive the round trip it
+# authorizes) and the age at which storage.reap_stale_reservations() calls
+# a 'pending' reservation abandoned (nothing in flight can be older).
 OUTBOUND_TIMEOUT_SECONDS = int(env("OUTBOUND_TIMEOUT_SECONDS", "60"))
 
 
@@ -208,7 +232,56 @@ POLICY_PATH = env("POLICY_PATH", os.path.join(ROOT, "policy_engine", "policy.jso
 POLICY_AUTH_SECRET_PATH = env(
     "POLICY_AUTH_SECRET_PATH", os.path.join(DATA_DIR, "policy_auth_secret.txt")
 )
+ADMIN_TOKEN_PATH = env("ADMIN_TOKEN_PATH", os.path.join(DATA_DIR, "admin_token.txt"))
 SETUP_VERIFIED_PATH = os.path.join(DATA_DIR, ".setup_verified")
+
+
+# ---------------------------------------------------------------------------
+# Admin plane authentication
+# ---------------------------------------------------------------------------
+
+_admin_token_cache: str | None = None
+
+
+def admin_token() -> str:
+    """The bearer token every /admin route requires. `""` means disabled.
+
+    Resolved lazily rather than at import, because the fallback branch
+    *writes a file* -- and importing a config module should not have that
+    side effect (tests reload this module repeatedly, and `python3 -m
+    common.config` should be safe to run anywhere).
+
+    Precedence is the usual one: an ADMIN_TOKEN in the environment or .env
+    wins. With nothing set, one is generated once and persisted next to the
+    other local secrets, so a fresh clone gets a real token without anyone
+    having to think about it -- the failure mode to avoid is an auth
+    mechanism that ships disabled because turning it on was a chore.
+    """
+    global _admin_token_cache
+    if _ADMIN_TOKEN_ENV is not None:
+        return _ADMIN_TOKEN_ENV
+    if _admin_token_cache is not None:
+        return _admin_token_cache
+
+    if os.path.exists(ADMIN_TOKEN_PATH):
+        with open(ADMIN_TOKEN_PATH) as f:
+            _admin_token_cache = f.read().strip()
+    else:
+        import secrets
+
+        token = secrets.token_urlsafe(32)
+        os.makedirs(os.path.dirname(ADMIN_TOKEN_PATH), exist_ok=True)
+        tmp = ADMIN_TOKEN_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(token + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ADMIN_TOKEN_PATH)
+        _admin_token_cache = token
+    return _admin_token_cache
+
+
+def admin_auth_enabled() -> bool:
+    return admin_token() != ""
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +296,22 @@ PROVISION_USDC = float(env("PROVISION_USDC", "0.5"))
 
 SEC_USER_AGENT = env("SEC_USER_AGENT", "agent-spend-policy-engine/0.1 (contact@example.com)")
 UPSTREAM_TIMEOUT_SECONDS = int(env("UPSTREAM_TIMEOUT_SECONDS", "10"))
+
+# The window the per-agent rate limit is measured over. Lives here rather
+# than as a constant in the policy engine so the limit an operator reasons
+# about ("15 per minute") and the window the code enforces can't drift.
+VELOCITY_WINDOW_SECONDS = int(env("VELOCITY_WINDOW_SECONDS", "60"))
+
+# Hard ceilings on the call arguments a /spend request may carry. These are
+# NOT the governance control -- policy.json's per-action `max_length` is
+# (see _resolve_params). These exist because /spend is unauthenticated by
+# design (anyone may *attempt* a spend; the signature decides whether it
+# succeeds) and every attempt, including a denial, is written into an
+# append-only ledger that nothing can delete. Without a ceiling, an
+# arbitrary amount of attacker-chosen bytes becomes permanent.
+MAX_PARAM_KEYS = int(env("MAX_PARAM_KEYS", "16"))
+MAX_PARAM_KEY_LENGTH = int(env("MAX_PARAM_KEY_LENGTH", "64"))
+MAX_PARAM_VALUE_LENGTH = int(env("MAX_PARAM_VALUE_LENGTH", "512"))
 
 
 def anchoring_disabled() -> bool:
@@ -243,6 +332,13 @@ def summary() -> list[str]:
     here isn't a setting you can't find, it's one you never thought to check
     because everything looked like it was working.
     """
+    admin = (
+        f"required (token in {ADMIN_TOKEN_PATH})"
+        if admin_auth_enabled() and _ADMIN_TOKEN_ENV is None
+        else "required (ADMIN_TOKEN from the environment)"
+        if admin_auth_enabled()
+        else "** DISABLED -- every /admin route is open **"
+    )
     return [
         f"network      : {NETWORK}" + ("  ** REAL FUNDS **" if IS_MAINNET else "  (test funds)"),
         f"algod        : {ALGOD_URL}",
@@ -250,10 +346,35 @@ def summary() -> list[str]:
         f"paying asset : USDC (ASA {USDC_ASA_ID})",
         f"facilitator  : {FACILITATOR_URL}",
         f"accounts     : {ACCOUNTS_PATH}",
+        f"admin auth   : {admin}",
+        f"demo routes  : {'enabled (/admin/sign, /admin/demo/*)' if ALLOW_DEMO_ENDPOINTS else 'disabled'}",
         f"config from  : {ENV_PATH if os.path.exists(ENV_PATH) else '(no .env -- using defaults)'}",
     ]
 
 
+# The subset start.sh needs in order to launch the services on the ports
+# this module resolved. Emitted as shell assignments so there is exactly one
+# resolver: the script used to hardcode 4021/4022/4023 and would happily
+# bind ports the rest of the system had been told to stop using.
+_EXPORTABLE = (
+    "BIND_HOST",
+    "RESOURCE_SERVER_PORT",
+    "POLICY_ENGINE_PORT",
+    "DASHBOARD_PORT",
+    "POLICY_ENGINE_URL",
+)
+
+
+def _shell_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
 if __name__ == "__main__":
-    print("\n".join(summary()))
+    if "--export" in sys.argv:
+        for name in _EXPORTABLE:
+            print(f"{name}={_shell_quote(globals()[name])}")
+    elif "--admin-token" in sys.argv:
+        print(admin_token())
+    else:
+        print("\n".join(summary()))
     sys.exit(0)

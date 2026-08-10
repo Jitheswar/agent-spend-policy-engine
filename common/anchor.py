@@ -33,13 +33,11 @@ import time
 import algosdk
 import requests
 from algosdk.transaction import PaymentTxn, wait_for_confirmation
-from algosdk.v2client import algod
 
-from common import config
+from common import algod, config
 from common.avm_client import load_accounts
 from policy_engine import storage
 
-ALGOD_URL = config.ALGOD_URL
 INDEXER_URL = config.INDEXER_URL
 EXPLORER_TX_URL = config.EXPLORER_TX_URL
 
@@ -77,8 +75,8 @@ def anchoring_disabled() -> bool:
     return config.anchoring_disabled()
 
 
-def _algod() -> algod.AlgodClient:
-    return algod.AlgodClient("", ALGOD_URL)
+def _algod():
+    return algod.client()
 
 
 def build_note(seq: int, head_hash: str) -> str:

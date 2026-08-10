@@ -79,7 +79,7 @@ def test_every_decision_path_lands_in_the_ledger(ledger):
     settled would vanish with it, which is exactly the kind of gap an audit
     trail exists to not have.
     """
-    row = storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=1.0)
+    row, _ = storage.try_reserve("agent_a", "weather", 0.01, daily_cap_usd=1.0)
     storage.finalize(row["id"], "approved", "settled", tx_id="ABC123")
 
     events = sorted(storage.get_audit_events(limit=100), key=lambda e: e["seq"])
