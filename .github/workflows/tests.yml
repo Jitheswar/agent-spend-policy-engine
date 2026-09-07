@@ -9,8 +9,6 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    # conftest.py sets ASPE_DISABLE_ANCHOR=1, so no Algorand testnet
-    # transaction is submitted and the suite needs no network or fees.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,4 +16,13 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r requirements.txt
+
+      # Four test modules call load_accounts() at import time, and
+      # data/accounts.json is gitignored because it holds key material.
+      # `generate` is offline -- algosdk.account.generate_account() and a
+      # file write, no algod call -- so CI mints its own throwaway set.
+      # They are never funded and die with the runner; conftest.py sets
+      # ASPE_DISABLE_ANCHOR=1, so nothing is ever submitted to testnet.
+      - run: python scripts/setup_accounts.py generate
+
       - run: pytest -q
