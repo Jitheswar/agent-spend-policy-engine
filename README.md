@@ -1,5 +1,7 @@
 # Agent Spend Policy Engine
 
+[![tests](https://github.com/Jitheswar/agent-spend-policy-engine/actions/workflows/tests.yml/badge.svg)](https://github.com/Jitheswar/agent-spend-policy-engine/actions/workflows/tests.yml)
+
 Autonomous agents try to spend money on paid APIs. A policy engine decides
 whether each spend is allowed *before* any payment is attempted. Approved
 spends settle for real on **Algorand testnet** via the **x402** protocol
